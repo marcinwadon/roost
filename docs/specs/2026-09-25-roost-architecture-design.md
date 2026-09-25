@@ -5,7 +5,8 @@
 - **Scope:** the whole product at the level of processes, protocols, state
   ownership, trust boundaries and module seams. Each subsystem gets its own
   spec that refines this one; where they disagree, this document wins until it
-  is amended:
+  is amended. Detailed catalogues (frames, tables, endpoints) live only in the
+  subsystem specs; this document points to them instead of repeating them:
   [ACP core](2026-09-26-acp-core-design.md),
   [MCP gateway](2026-09-26-mcp-gateway-design.md),
   [kernel](2026-09-26-kernel-design.md),
@@ -59,6 +60,7 @@ In:
 - Permission requests and elicitation (multiple-choice forms, e.g. the agent's
   "ask the user" tool), with **delivery acknowledgement** (§6.8).
 - Cancel, resume, park, close; recovery after a host reconnect.
+- Session delete and per-hat purge (§6.10).
 - Image attachments in prompts; slash commands.
 - Session list sorted by time with day headers; search across all sessions.
 - Mobile-first PWA with **Web Push** — "the agent asks, I answer from my
@@ -85,10 +87,10 @@ similar personal automation.
 | **Session** | One agent conversation. Belongs to exactly one host and exactly one hat. |
 | **Hat** | An isolation boundary (a client, a secret project, …). §8. |
 | **Control frame** | A roost-defined message between host and collector. |
-| **ACP payload** | An ACP message carried verbatim inside a roost envelope. |
+| **ACP payload** | An ACP message carried verbatim inside a roost `session` frame. |
 | **Connection** | An upstream MCP server configured in the gateway, with its credential. |
-| **Mount** | A grant that lets a principal (host × hat, or a standalone client) use a connection. |
-| **Principal** | Whoever presents an MCP client token to the gateway. |
+| **Mount** | A grant that lets sessions on a host (in the connection's hat), or a standalone client, use a connection. |
+| **Principal** | Whoever presents an MCP client token to the gateway: a session (one token per session) or a standalone client. |
 
 ---
 
@@ -103,7 +105,8 @@ similar personal automation.
                               │  collector   │◄──►(OAuth / PAT, HTTPS)
                               │  SQLite      │
                               │  gateway mod │◄── agents' MCP clients
-                              └──────▲───────┘    (/mcp/<token>/<slug>)
+                              └──────▲───────┘    (/mcp/<slug>, token in
+                                     │             Authorization header)
                                      │ WebSocket (host dials out)
                  ┌───────────────────┼───────────────────┐
              ┌───┴───┐           ┌───┴───┐           ┌───┴───┐
@@ -120,8 +123,8 @@ similar personal automation.
 - **Host** dials *out* to the collector over WebSocket, so it works behind NAT
   and needs no inbound port. It spawns adapters as subprocesses, implements the
   client side of ACP (terminal, filesystem, permission and elicitation
-  callbacks), enumerates projects under workspace roots, and renders MCP
-  entries into agent configs.
+  callbacks), and enumerates projects under its configured workspace roots. It
+  never writes agent config files.
 
 ### 3.2 Rejected topologies
 
@@ -149,12 +152,11 @@ Why the same frames, never in-process function calls: otherwise the single-
 machine path becomes the only tested one and the multi-host path rots. One
 code path, exercised by every installation.
 
-Honest limit: **upgrading the binary eventually restarts the host too**, and a
-host restart parks every session (§6.6). Sessions are resumable, not
-uninterrupted. After an upgrade the supervisor can restart the collector child
-on its own, and restarts the host child only when no session has a turn in
-flight (or when the operator forces it); the mechanics belong to the
-distribution spec.
+Honest limit: **upgrading the binary restarts the host too**, and a host
+restart parks every session (§6.6). Sessions are resumable, not
+uninterrupted. The upgrade path is a restart through the service manager;
+until it happens, roost warns (Hosts view, `doctor`) that a restart is needed
+(distribution §5.3).
 
 The all-in-one host is paired automatically over the local channel (§7.6) —
 the operator never sees an enrollment code for it.
@@ -163,30 +165,25 @@ the operator never sees an enrollment code for it.
 
 ## 4. Data model sketch
 
-Indicative, not a schema. Every table has `owner_id`.
+Indicative, not a schema: which tables exist and who owns them. Columns are
+defined in the owning subsystem spec. Every table has `owner_id`.
 
-| Entity | Key fields | Notes |
+| Table | Owner | Notes |
 |---|---|---|
-| `owner` | id, created_at | Exactly one row in v1. |
-| `password_credential` / `passkey` | owner_id, … | argon2 hash; WebAuthn credentials. |
-| `host` | id, name, public_key, default_hat_id, last_seen, versions, capabilities, revoked_at | Per-host credential (§7.6). |
-| `hat` | id, name, theme (colour, logo), push_policy | A default hat exists from setup (§8.2). |
-| `hat_path_rule` | host_id, path_prefix, hat_id | Segment-matched, longest prefix wins. |
-| `session` | id, host_id, hat_id, source_kind, agent, cwd, title, lifecycle, activity, created_at, last_event_at | `source_kind` = `acp` in v1; reserves room for `observed`. |
-| `event` | event_id (collector-global, monotonic), session_id, host_seq, kind, indexed fields, payload (opaque JSON), ts | Unique on `(session_id, host_seq)`. |
-| `pending_request` | session_id, request_id, kind (permission / elicitation), payload, state | State: open / delivered / dropped / cancelled. |
-| `project_recent` | host_id, hat_id, path, last_used | Filtered by hat. |
-| `gw_connection` | slug, label, url, hat_id, credential_kind, tool_allowlist | Belongs to exactly one hat. |
-| `gw_credential` | connection_id, ciphertext, expires_at | Encrypted at rest (§10.1). |
-| `gw_client` | id, token_hash, principal (host×hat or standalone client) | Token per (host, hat). |
-| `gw_mount` | hat_id, host_id, connection_id | The hat × host grid. |
-| `push_subscription` | endpoint, keys, device label | |
-| `setting` | key, value | Includes `public_url`. |
-
-Subsystem specs add tables: `turns`, `attachments`, `session_catalog`,
-`host_agent_catalog`, `plans` (ACP core §8); `gw_oauth_clients` and the
-`oauth_client` credential kind (gateway §2); `auth_sessions` and
-`push_subscriptions` details (kernel).
+| `owners`, `password_credentials`, `passkeys`, `auth_sessions` | kernel §1.1 | Exactly one owner in v1. |
+| `hosts`, `pairing_codes` | kernel §1.1 | Per-host credential (§7.6). |
+| `hats`, `hat_path_rules` | kernel §5.1 | A default hat exists from setup (§8.2). |
+| `settings`, `project_recents`, `push_subscriptions`, `purged_hats` | kernel §1.1 | `settings` includes `public_url`; recents are per (host, hat). |
+| `sessions` | ACP core §8 | `source_kind` = `acp` in v1; reserves room for `observed`. |
+| `events` | ACP core §8 | Global monotonic `event_id`; unique on `(session_id, host_seq)`; collector-originated events have `host_seq` NULL. |
+| `turns`, `pending`, `answer_queue` | ACP core §8 | Pending states: open / delivered / cancelled. |
+| `attachments`, `event_attachments` | ACP core §8 | Content-addressed files in the data directory, not BLOBs. |
+| `session_catalog`, `host_agent_catalog`, `plans` | ACP core §8 | Filled from host extracts only. |
+| `gw_connections`, `gw_credentials`, `gw_oauth_clients` | gateway §2 | A connection belongs to exactly one hat; credentials encrypted at rest (§10.1). |
+| `gw_mounts` | gateway §2 | (connection, host); the hat comes from the connection. |
+| `gw_session_tokens` | gateway §2 | One token per session, stored as a hash. |
+| `gw_clients`, `gw_client_pins` | gateway §2 | Standalone clients and their pinned connections. |
+| `gw_stdio_servers` | gateway §3.4 | Local stdio MCP servers per (host, hat). |
 
 ---
 
@@ -201,26 +198,32 @@ Subsystem specs add tables: `turns`, `attachments`, `session_catalog`,
 
 ### 5.2 Two layers: control frames and verbatim ACP
 
-1. **Control frames** are roost's own, with roost's own schema: `hello`,
-   `hello_ack`, `start_session`, `session_started`, `prompt`, `cancel`,
-   `close_session`, `resume_session`, `permission_response`,
-   `elicitation_response`, `answer_delivered` / `answer_dropped`,
-   `list_projects`, `browse_directory`, `apply_mcp_mounts`, `ack`, `error`, and
-   so on. The full catalogue lives in the ACP-core spec.
+The frame catalogue is defined once, in [ACP core §3.3](2026-09-26-acp-core-design.md#33-frame-catalogue).
+The principles:
+
+1. **Control frames** are roost's own, with roost's own schema: requests from
+   the collector, the handshake, acks, rejections and probe responses.
 2. **ACP payloads** (`session/update`, `session/request_permission`,
-   `elicitation/create`, …) travel **verbatim** inside a `session_event`
-   envelope.
+   `elicitation/create`, …) travel **verbatim** inside the body of a `session`
+   frame.
+3. **State-bearing facts travel on the outboxed, sequenced `session` stream**
+   (session started, turn started and ended, a request opened or resolved,
+   config applied, answer result, parked, closed, …), never only as a
+   correlated response. Correlated responses exist only for rejections and
+   for connection-scoped probes. A request that changes state is completed when
+   the collector ingests the fact that carries its `request_id`.
 
-ACP *requests* from the adapter to the host (permission, elicitation) are
-forwarded the same way, tagged with a host-assigned `request_id`; the
-operator's answer comes back as a control frame (`permission_response`,
-`elicitation_response`) carrying that id, and the host completes the pending
-ACP call.
+ACP *requests* from the adapter to the host (permission, elicitation) become
+pending requests with a host-minted, globally unique `pending_id`; the
+operator's answer comes back as a control frame carrying that id, and the host
+completes the pending ACP call. `request_id` means request/response
+correlation only.
 
-The envelope carries only what the collector needs to store, index and route:
-`session_id`, `seq`, `kind`, and a small set of **indexed fields** the host
-extracts (e.g. activity change, title change, "a permission is pending"). The
-collector never parses the ACP payload itself.
+A `session` frame carries only what the collector needs to store, index and
+route: `session_id`, `seq`, a body `kind`, and a closed set of **typed
+extracts** the host fills (activity, title, pending request and its option ids,
+commands, config catalogue, plan, …). The collector never parses the ACP
+payload itself.
 
 Only two components understand ACP shapes: the **host**, which runs ACP, and the
 **frontend**, which renders it using the official ACP SDK types.
@@ -233,21 +236,12 @@ nothing failed — it simply never arrived.
 
 ### 5.3 Hello and versioning
 
-The first frame from a host is `hello`:
-
-```json
-{
-  "type": "hello",
-  "protocol_version": "1.0",
-  "host_version": "0.3.1",
-  "host_id": "…",
-  "proof": "…",
-  "capabilities": ["runtimes", "projects", "mcp_mounts", "images"],
-  "adapters": [{"id": "claude", "version": "…"}, {"id": "codex", "version": "…"}],
-  "attached_sessions": [{"session_id": "…", "last_seq": 1234}],
-  "outbox_from_seq": {"<session_id>": 1201}
-}
-```
+The first frame from a host is `hello`: protocol version, host version, host
+id and proof of possession (§5.9), capabilities, agents, workspace roots and
+the sessions it still has attached. Its fields and the handshake that follows
+(`hello_ack` → resend → `resend_complete`) are defined in ACP core §3.3 and
+§5.1. The protocol version appears only in `hello` / `hello_ack`, never per
+frame.
 
 - `protocol_version` is `MAJOR.MINOR`. Minor versions are additive only.
 - The collector accepts hosts whose protocol **major** is its own (M) or the
@@ -256,8 +250,12 @@ The first frame from a host is `hello`:
   state in the Hosts view. Never a silent half-working connection.
 - **Unknown frame types** are logged with a warning (rate-limited) and ignored.
   They are never silently lost and never crash the connection.
-- `capabilities` gate features: the collector does not send a frame kind the
-  host did not advertise, and the UI hides features no connected host supports.
+- `capabilities` is a closed list (ACP core §3.3). The collector does not send
+  a frame a host's capabilities do not cover, and the UI hides features the
+  host lacks.
+- The collector reconciles the host's sessions (parks missing ones, ends their
+  turns, cancels their pending requests) only after `resend_complete`, so facts
+  still in the outbox are never overtaken by a guess.
 
 ### 5.4 One source of truth for message types
 
@@ -283,35 +281,44 @@ they got their expected error from a timeout, not from the missing handler.
 
 ### 5.5 Sequence numbers, acks, idempotent ingest
 
-- The host stamps every session-scoped frame with a **per-session monotonic
+- The host stamps every `session` frame with a **per-session monotonic
   `seq`**, assigned when the frame enters the outbox.
 - Collector ingest is **idempotent on `(session_id, seq)`**: a duplicate is
-  acknowledged and discarded.
-- The collector acknowledges with `ack {session_id, ack_seq}` (cumulative) after
-  the event is committed to SQLite. The host drops acknowledged frames from its
-  outbox.
+  acknowledged and discarded; the same `seq` with a different payload is
+  stored as a conflict, never silently dropped.
+- The collector acknowledges with `ack {session_id, ack_seq}`, where `ack_seq`
+  is the highest seq it has committed for that session, after the commit
+  (commits are grouped, at most every 50 ms). The host deletes frames with
+  `seq ≤ ack_seq` from its outbox.
+- `hello_ack` reports the collector's highest committed seq per attached
+  session; a host whose own counter is lower (outbox lost) fast-forwards past
+  it.
 - `seq` exists only for host → collector delivery. It is **not** the browser's
   cursor; the collector assigns its own global `event_id` on ingest (§11.2).
 
 ### 5.6 Outbox on disk
 
-The host writes every outgoing session frame to a small on-disk outbox (append
-log or embedded SQLite) before sending. A host crash or upgrade restart
-therefore leaves no gap in the transcript: on reconnect, `hello` announces what
-is unacknowledged and it is resent.
+The host writes every outgoing `session` frame to a small on-disk outbox
+(embedded SQLite) before sending. A host crash or upgrade restart therefore
+leaves no gap in the transcript: on reconnect everything unacknowledged is
+resent.
 
-The outbox is bounded (default 64 MiB, configurable). On overflow the host
-drops the oldest unacknowledged frames of the affected session and emits a
-`transcript_gap {session_id, from_seq, to_seq}` frame, which the UI renders
-visibly. Loss is allowed only if it is visible.
+The outbox is bounded (default 64 MiB, configurable). **State-bearing frames
+are never dropped.** On overflow the host drops only ACP updates carrying
+message or thought chunks (then large tool outputs), oldest first, and puts a
+`transcript_gap {from_seq, to_seq}` frame in their place, which the UI renders
+visibly. Loss is allowed only if it is visible. Details, including chunk
+coalescing, in ACP core §5.5.
 
-### 5.7 Request / response control frames
+### 5.7 Requests, timeouts and disconnects
 
-Control requests (`start_session`, `list_projects`, `browse_directory`,
-`apply_mcp_mounts`, …) carry a `request_id`; the response echoes it. The
-collector applies a per-kind timeout (default 15 s) and returns a readable error
-to the UI on expiry. A response for an unknown or expired `request_id` is
-logged and dropped.
+Collector requests carry a `request_id`. The collector applies a per-kind
+timeout that, for state-changing requests, is at least the WebSocket read
+deadline. When the host connection drops, every in-flight HTTP waiter for that
+host fails at once with "host disconnected; delivery unknown", and the
+affected start or turn is marked **awaiting reconciliation** — never failed —
+until the host's resend and `hello` settle it (ACP core §3.4). A response for
+an unknown or expired `request_id` is logged and dropped.
 
 ### 5.8 Liveness
 
@@ -330,6 +337,12 @@ The host authenticates each connection with its per-host credential (§7.6)
 inside `hello` (`host_id` plus a proof of possession of its private key over a
 collector-supplied nonce). A revoked host is rejected with a distinct error so
 `roost doctor` can say "this host was revoked" rather than "connection failed".
+
+A host has at most **one live connection**. A second connection for the same
+host id is rejected with a distinct error, never silently superseding the
+first; the collector closes the older connection only if it has missed its
+liveness deadline. On the host side an exclusive lock on the data directory
+stops a second `roost host run`.
 
 ---
 
@@ -397,8 +410,9 @@ the kind name.
 
 - A permission or elicitation request has **no timeout**. A question asked at
   night waits until morning.
-- It is cancelled only when the adapter is lost (host restart, adapter crash),
-  and the cancellation is shown explicitly on the card ("the agent is no longer
+- It is cancelled only when the turn is cancelled, the session is parked or
+  closed, or the adapter is lost (host restart, adapter crash), and the
+  cancellation is shown explicitly on the card ("the agent is no longer
   waiting — resume to continue").
 - The idle reaper **never** parks a `blocked` session: a pending request is by
   definition mid-turn.
@@ -407,34 +421,47 @@ the kind name.
 
 | Event | Behaviour |
 |---|---|
-| WebSocket drops, host process survives | Host reconnects; `hello` lists attached sessions and unacked seqs; outbox is resent; collector reconciles. Sessions stay `active`, pending requests stay open. |
-| Collector restarts | Same as above from the host's side. Nothing is parked. |
-| Host restarts (crash, upgrade, reboot) | Adapters die with it. On reconnect, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
+| WebSocket drops, host process survives | In-flight HTTP calls fail with "delivery unknown". Host reconnects; `hello` lists attached sessions; the outbox is resent; after `resend_complete` the collector reconciles. Sessions stay `active`, pending requests stay open. |
+| Collector restarts | Same as above from the host's side. Nothing is parked; `starting` sessions are reconciled on the host's next handshake. |
+| Host restarts (crash, upgrade, reboot) | Adapters die with it. After `resend_complete`, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
 | Host offline longer than the offline threshold (default 10 min, configurable) | Collector marks its sessions `parked` with a visible "host offline" note (presumed, not reported). On reconnect, `hello.attached_sessions` is authoritative: sessions whose adapter is still attached go `parked → active` without a resume, pending requests intact; the rest stay `parked`. |
 | Idle (default 30 min, configurable, never mid-turn, never `blocked`) | Host's reaper releases the adapter; session becomes `parked`. |
 | `session/load` fails | Session becomes `failed` with a readable reason (e.g. the agent CLI has no record of that session). |
-| Adapter crashes mid-turn | `turn_interrupted` + `parked`; stderr tail attached to the event for diagnosis. |
+| Adapter crashes mid-turn | Host emits `turn_ended{interrupted}` and parks the session; the scrubbed stderr tail is attached for diagnosis. |
+
+`turn_ended{interrupted}` is the only representation of an interrupted turn.
+The host emits it whenever it can observe the interruption (adapter exit,
+close or park mid-turn); the collector synthesises it only for host restarts.
 
 ### 6.7 Resume and park
 
-- **Resume** of a `parked`, `closed` or `failed` session: host spawns the
-  adapter, calls `session/load` with replay suppression, re-applies the stored
-  model then mode (model first: switching model can clamp the available modes),
-  and reports the resulting configuration. The collector stores what the host
-  reports after the switch, never the pre-switch catalogue.
-- **Park** is available explicitly; it is what the reaper does.
+- **Resume** of a `parked`, `closed` or `failed` session: the collector
+  re-resolves the session's hat from its path and refuses the resume if it no
+  longer matches (the operator must re-assign explicitly, §8.2); then the host
+  spawns the adapter, calls `session/load` with replay suppression, re-applies
+  the stored model then mode (model first: switching model can clamp the
+  available modes), and reports the resulting configuration. The collector
+  stores what the host reports after the switch, never the pre-switch
+  catalogue.
+- **Park** is available explicitly (a button and an API call); it is also what
+  the reaper does.
+- **Prompt or config** on a session that is not attached (parked, or its host
+  offline) is refused with `not_attached`; the UI offers resume.
 
 ### 6.8 Delivery acknowledgement for answers
 
 An answer to a permission or elicitation travels collector → host → adapter.
-The HTTP 202 to the browser proves only that the collector accepted it. The
-host knows whether an adapter callback was actually waiting for it, and reports
-`answer_delivered` or `answer_dropped`. Cards show "answered" only after
-`answer_delivered`.
+The HTTP 202 to the browser proves only that the collector accepted it: the
+collector stores it in a durable answer queue keyed by the request's
+`pending_id` and delivers it now, or when the host reconnects. The host knows
+whether an adapter callback was actually waiting for it, and reports
+`answer_result{delivered}` on the outboxed stream. Cards show "answered" only
+after `delivered: true`. An answer to a request that is no longer open is
+refused (409).
 
-When several clients answer the same request (phone and desktop), the first
-delivered answer wins and a later drop must not overwrite it: the fold over
-acknowledgements is monotonic (`delivered` sticks).
+When verdicts for the same request reach several clients (phone and desktop),
+the fold over them is monotonic: `delivered` sticks and a later
+`delivered: false` must not overwrite it.
 
 ### 6.9 One adapter process per session
 
@@ -454,6 +481,20 @@ It saves memory but a single fault takes every session in the group down, and
 it would need per-session isolation that Codex does not offer inside one
 process.
 
+### 6.10 Delete and purge
+
+Closing keeps everything. Deleting is separate and explicit, and requires
+step-up authentication (§7.3):
+
+- **Delete a session** removes its events, attachments, turns and pending
+  requests (ACP core §4.10).
+- **Purge a hat** removes all of its sessions, its gateway connections with
+  their grants, and its path rules; hosts delete their composed agent homes for
+  that hat on their next connection (kernel §5.5).
+
+Both exist in v1 because a hat can hold a client's data that must be removable
+on request.
+
 ---
 
 ## 7. Authentication and pairing
@@ -461,32 +502,44 @@ process.
 ### 7.1 Why built in
 
 Delegating everything to an external identity provider was rejected: a
-single-machine install must work without one. Built-in auth plus an optional
-trusted-proxy mode covers both ends.
+single-machine install must work without one. Built-in auth is the only login
+path in v1; OIDC and identity from a fronting proxy are deferred (§15).
+
+*Rejected for v1:* a trusted-proxy mode that honours an identity header from a
+configured proxy address. With a proxy on loopback (the common setup), any
+local process can send that header, so header identity is forgeable. A later
+version may accept **signed** assertions only (e.g. a Cloudflare Access JWT).
 
 ### 7.2 Bootstrap
 
-On first start with an empty database the collector prints a **one-time setup
-link** (random token, expires, single use) to create the owner account. There is
-no default password and no "first visitor becomes admin" window.
+On first start with an empty database the collector creates a **one-time setup
+link** (random token, expires, single use) to create the owner account. It
+prints the full link only when stdout is a terminal; otherwise it logs only the
+path of the file that holds it (kernel §3.1). There is no default password and
+no "first visitor becomes admin" window.
 
 ### 7.3 Operator login
 
 - Password (argon2id) and **passkeys** (WebAuthn), passkeys as the primary path.
 - Session cookie: `HttpOnly`, `Secure` (except on `localhost`),
   `SameSite=Strict`.
-- **Trusted-proxy mode** (optional): the collector accepts an identity header
-  (e.g. from Cloudflare Access, oauth2-proxy, Tailscale identity headers)
-  **only** when the request's peer address matches an explicitly configured
-  proxy address. From any other peer the header is rejected (and logged), never
-  silently ignored and never honoured.
+- **Step-up authentication** (a fresh passkey or password check within the
+  last 5 minutes) for: minting pairing codes, creating or editing gateway
+  connection URLs and credentials, local stdio server configuration, revoking
+  hosts, sessions or passkeys, deleting sessions, purging hats, and changing
+  `public_url` (kernel §3.4).
 - OIDC is deferred.
 
 ### 7.4 Request authentication
 
-Every API call is authenticated — there is no "open on the LAN" mode. SSE and
-WebSocket endpoints check `Origin`. Every row carries `owner_id` and every query
-filters by it.
+Every API call is authenticated — there is no "open on the LAN" mode.
+State-changing browser requests require a matching `Origin` (a missing
+`Origin` is rejected); browser `GET`s, on which browsers send no `Origin`,
+are checked with `Sec-Fetch-Site`; the few
+routes authenticated otherwise (host WebSocket, enrollment, the MCP proxy, the
+OAuth callback, health checks) are listed with their mechanism in kernel §3.3.
+Every HTML response carries a strict Content-Security-Policy (kernel §7).
+Every row carries `owner_id` and every query filters by it.
 
 *Rejected:* an unauthenticated LAN mode. The predecessor left the dashboard API
 open on the local network; fine for one person's network, indefensible for a
@@ -494,8 +547,10 @@ product others install.
 
 ### 7.5 `public_url` and TLS
 
-- `public_url` is a **required** setting: MCP OAuth callbacks and push
-  notification links are built from it.
+- `public_url` is a **required** setting: MCP OAuth callbacks, passkeys (RP id
+  and origin) and push notification links are built from it. Changing it
+  invalidates passkeys and OAuth client registrations; Settings warns that both
+  must be redone.
 - Web Push on iOS works only from an installed PWA over HTTPS, and push is core,
   so **v1 requires TLS** for anything but `localhost`.
 - Supported topologies, all documented:
@@ -511,9 +566,13 @@ product others install.
 2. On the machine: `roost host join https://collector.example CODE`.
 3. The host generates a keypair, sends the public key with the code; the
    collector registers a **per-host credential** and returns the host id.
-4. Hosts are listable, renameable and **individually revocable**.
+4. Hosts are listable, renameable and **individually revocable**. A revoked
+   host's adapters keep running until it next connects; it is then told it is
+   revoked and stops them.
 
-The all-in-one host is paired automatically over the local channel.
+Wrong codes are rate-limited per client address. Pairing is idempotent: a host
+whose existing key the collector still accepts is not paired again. The
+all-in-one host is paired automatically over the local channel.
 
 *Rejected:* one shared fleet token. In the predecessor a single token
 authenticated every machine: impossible to revoke one laptop, and anyone holding
@@ -543,11 +602,17 @@ client B's integrations, which is the actual risk.
     match a rule for `~/Projects/acme`.
   - **Longest prefix wins**: `~/Projects/acme/secret/**` beats
     `~/Projects/acme/**`.
-  - Paths are normalised (home expansion, trailing slashes, `..` removed)
-    before matching. Symlinks: open question for the ACP-core spec.
-- The hat is **stored on the session at start**. Changing rules later does not
-  re-bucket history. Re-assigning a session is allowed but explicit and logged
-  as a timeline event.
+  - Paths are canonicalised **on the host** (absolute, symlinks resolved,
+    `.`/`..` removed, no trailing slash) before matching (kernel §5.2).
+- Sequence at start: the host resolves the typed path to its canonical form →
+  the collector matches the rules → the hat is **stored on the session** with
+  the canonical path → the session starts. Changing rules later does not
+  re-bucket history.
+- On resume the hat is re-resolved; if it differs from the stored one, the
+  resume is refused with a clear error until the operator re-assigns the
+  session explicitly.
+- Re-assigning a session is allowed only while it is parked, with a warning,
+  and is logged as a timeline event.
 - No "shared" hat in v1.
 
 ### 8.3 What isolation covers
@@ -559,14 +624,17 @@ the operator's view. The single operator sees all hats; the "All" view stays.
   v2, hat B's memory or context).
 - A gateway connection belongs to **exactly one hat**. The same vendor in two
   hats is two connections with **separate OAuth grants**.
-- MCP client tokens are per **(host, hat)**. The gateway derives scope from the
-  token, never from anything the client claims.
+- Gateway client tokens are minted **per session** for that session's (host,
+  hat), stored only as hashes and revoked when the session parks, closes or
+  loses its adapter, or its host is revoked. The gateway derives scope from the
+  token at request time, never from anything the client claims.
 
 Side channels that must respect the boundary:
 
 - Project picker recents are filtered by hat.
 - Push notification content is minimal by default (session name, no transcript
-  excerpt), configurable per hat.
+  excerpt), configurable per hat, including a generic title that omits the
+  session name.
 - v2 LLM features configure their LLM endpoint per hat.
 
 Hats also drive UI filtering, theming and per-hat push muting.
@@ -580,29 +648,52 @@ what a push notification reveals.
 Hats do **not** sandbox agents. Every adapter on a host runs as the same OS user
 as the host and has shell access. A misbehaving or prompt-injected agent in hat
 A can read anything that user can read — including the host's data directory
-(other hats' mount tokens, the outbox with other hats' transcripts, the host
-credential) and other projects on disk. No config-injection mechanism (§8.5,
-open question 1) changes that.
+(the outbox with other hats' transcripts, the host credential, other hats'
+composed agent homes) and other projects on disk. It can also read other
+sessions' gateway tokens from the process list, because the Claude adapter
+passes MCP servers to its CLI on the command line (gateway §3.2); per-session
+tokens limit that to live sessions.
+
+**The collector is in the same position in the default install.** `roost up`
+runs the collector as the same OS user as every agent, so any agent can read
+`master.key`, `roost.db` (every transcript and every encrypted grant) and use
+`admin.sock`. roost says so plainly: whenever the gateway holds credentials
+for more than one hat, run the collector as a separate OS user or in a
+container (the Docker image), and `roost up` warns in that situation (kernel
+§10). Destructive admin-socket commands additionally require interactive
+confirmation on a terminal.
+
+**Agent configuration outside roost.** Per-session isolation (§8.5) covers MCP
+servers only. Each Claude session still loads the user's own `~/.claude`
+configuration — `CLAUDE.md` and its imports, auto-memory, hooks, skills and
+plugins — and Codex loads the global `AGENTS.md` and any `notify` command.
+These are accidental cross-hat channels outside roost's control in v1 (open
+question in §16).
 
 A hat that needs strong isolation belongs on **its own host**: a separate OS
 user, container or machine, paired as a separate host whose default hat is that
 hat. The documentation says this plainly, next to the hat settings.
 
-### 8.5 Known dependency: mixed hosts and agent MCP config
+### 8.5 Mixed hosts and agent MCP config
 
-Per-(host, hat) tokens make the gateway's own checks correct. But agents read
-MCP servers from their own config, which is **one file per user** for both
-Claude Code and Codex. If a mixed host's global config held URLs and tokens for
-both hats, a hat-A session would be offered hat B's connections as ordinary
-tools. Keeping roost's own channels hat-clean on a mixed host (within the limits
-of §8.4) therefore needs a per-project or per-session injection path, which is
-the subject of the spike in [Open questions](#16-open-questions).
+Agents read MCP servers from their own config, which is **one file per user**
+for both Claude Code and Codex; a global entry would be offered to every hat on
+that host. roost therefore passes MCP servers **per session over ACP**
+(measured in [the spike](../spikes/2026-09-25-per-session-mcp.md); ACP core §6):
 
-**v1 fallback if no per-project/per-session path works for an agent:** on a
-mixed host, that agent's config receives only the mounts of the host's
-**default hat**; sessions in other hats on that host run without gateway MCP
-servers, and the UI says so on the mount grid and at session start. Isolation is
-never silently weakened to make a feature work.
+- **Claude:** a strict-MCP flag on every `session/new` / `session/load` keeps
+  the session to the servers roost passes.
+- **Codex:** a roost-owned composed `CODEX_HOME` per hat. Whether several Codex
+  processes can safely share its state is unmeasured, so until a live gate
+  measures it **Codex on a mixed host uses the fallback**.
+- **Generic adapters, and any agent with an adapter override** (custom
+  command, custom CLI path): the fallback, unless the operator explicitly
+  accepts unverified isolation.
+
+**Fallback:** on a mixed host, sessions in the host's default hat get the
+default hat's mounts; sessions in other hats run without gateway MCP servers,
+and the UI says so on the mount grid and at session start. Isolation is never
+silently weakened to make a feature work.
 
 ---
 
@@ -611,36 +702,39 @@ never silently weakened to make a feature work.
 Three modules plus a shared kernel. Dependencies point one way.
 
 ```
-        ┌──────────────┐     ┌──────────────┐
-        │   ACP core   │     │ MCP gateway  │
-        │ hosts,       │     │ connections, │
-        │ sessions,    │     │ OAuth, proxy,│
-        │ push         │     │ manifests    │
-        └──────┬───────┘     └──────┬───────┘
-               │   implements        │ defines
-               │   ClientIdentity,   │ ClientIdentity,
-               │   MountPolicy,      │ MountPolicy,
-               │   Notifier  ───────►│ Notifier
-               ▼                     ▼
-        ┌─────────────────────────────────────┐
-        │ kernel: auth, hats, storage, config, │
-        │ message types, HTTP server           │
-        └─────────────────────────────────────┘
-        distribution: CLI, supervisor, runtime manager, renderers
+        ┌──────────────┐  SessionMcp   ┌──────────────┐
+        │   ACP core   │──────────────►│ MCP gateway  │
+        │ sessions,    │ (trait defined│ connections, │
+        │ host protocol│  by gateway)  │ OAuth, proxy,│
+        │ push triggers│               │ renderers    │
+        └──────┬───────┘               └──────┬───────┘
+               ▼                              ▼
+        ┌──────────────────────────────────────────────┐
+        │ kernel: auth, hosts & pairing, hats, storage, │
+        │ config, push delivery, outbound HTTP policy,  │
+        │ purge hook, message types, HTTP server        │
+        └──────────────────────────────────────────────┘
+        roost binary: CLI (incl. `roost mcp apply`), supervisor, wiring
 ```
 
-- **ACP core** owns hosts, sessions, the host protocol, push, the session UI.
-- **MCP gateway** owns connections, credentials, OAuth, the proxy and manifests.
-  It imports nothing from ACP core. It needs exactly three interfaces, which it
-  defines and others implement (§10.2).
-- **Kernel** owns operator auth, hats and path rules, storage, configuration,
-  generated types and the HTTP server.
-- **Distribution** owns the CLI, the supervisor, the managed runtime, service
-  installation and the config renderers.
+- **ACP core** (`roost-host`, `roost-sessions`) owns sessions, the host
+  protocol, push triggers and the session UI. It obtains a session's MCP
+  servers through the `SessionMcp` trait, which the gateway defines and
+  implements (ACP core §1). The dependency points sessions → gateway.
+- **MCP gateway** (`roost-gateway`) owns connections, credentials, OAuth, the
+  proxy, per-session tokens, manifests and the config renderers. It imports
+  nothing from ACP core and needs three interfaces (§10.2).
+- **Kernel** (`roost-kernel`) owns operator auth, hosts and pairing, hats and
+  path rules, storage, configuration, generated types, the HTTP server, the
+  outbound HTTP (egress) policy used by the gateway and by push, push delivery,
+  and the hat purge hook that sessions and the gateway implement.
+- **The `roost` binary** owns the CLI (including the `roost mcp apply` wiring
+  for the gateway's renderers), the supervisor, the managed runtime and service
+  installation.
 
 The test that the boundary holds: `roost gateway` (standalone) builds and runs
 with the ACP core absent from its wiring. In Rust this is a Cargo workspace
-where the gateway crate does not depend on the ACP-core crate.
+where the gateway crate does not depend on the ACP-core crates.
 
 ### 9.1 Implementation language: Rust
 
@@ -675,10 +769,12 @@ Versions and exact usage are pinned in the subsystem specs and plans.
 Refined in its own spec. This section fixes the boundary and the invariants.
 
 **Operator experience: one place.** The operator adds every MCP integration
-once, in the MCP view, and for each one ticks which hosts receive it. That is
-the whole mental model. Everything below — the connection's hat, per-(host,
-hat) client tokens, manifests, renderers — is machinery that turns those ticks
-into agent config; the operator never handles tokens or config files by hand.
+once, in the MCP view, and for each one ticks which hosts receive it; every
+host is listed for every connection, because a mixed host isolates per session.
+That is the whole mental model. Everything below — the connection's hat,
+per-session client tokens, manifests, renderers — is machinery that turns those
+ticks into agent sessions; the operator never handles tokens or config files by
+hand.
 
 ### 10.1 What it owns
 
@@ -704,34 +800,48 @@ into agent config; the operator never handles tokens or config files by hand.
     advertise them upstream).
   - Unknown token or unmounted connection → `404`, not `403` (don't confirm
     existence).
+  - Responses carry `X-Content-Type-Options: nosniff` and only JSON or SSE
+    content types.
+- **Outbound requests** (proxy, OAuth discovery, registration and token calls)
+  never follow redirects and reach only public addresses unless a connection
+  is explicitly marked "internal network" (the kernel's egress policy, kernel
+  §7.1).
+- **Local stdio MCP servers** per (host, hat), configured in the same view and
+  passed to sessions on that host as ACP stdio entries, not proxied
+  (gateway §3.4).
 - **Credentials encrypted at rest** with a master key generated on first run
   (0600 file in the data directory, or supplied via an environment variable).
 
 The documentation states plainly: **the gateway is a single point of compromise
-for every integration it holds.** Hats limit what one host's token can reach;
-they do not protect against compromise of the collector itself.
+for every integration it holds.** Hats limit what one session's token can
+reach; they do not protect against compromise of the collector itself, and in
+the default install every agent runs as the collector's OS user (§8.4).
 
 ### 10.2 Interfaces it needs from the rest
 
 | Interface | Full product | Standalone `roost gateway` |
 |---|---|---|
-| `ClientIdentity` (token → principal) | "host X, hat H" | a manually created client |
-| `MountPolicy` (principal → connections) | the hat × host mount grid | a list pinned to the client |
+| `ClientIdentity` (token → principal) | a session token → "session S on host X, hat H" | a manually created client |
+| `MountPolicy` (principal → connections) | connections of hat H mounted on host X | the connections pinned to the client |
 | `Notifier` (credential expired / failing) | Web Push + UI badge | log line and optional webhook |
+
+In full mode the `roost` binary wires implementations backed by gateway and
+kernel tables; `roost-sessions` reaches the gateway only through `SessionMcp`
+(§9).
 
 ### 10.3 Manifests and renderers
 
 **roost sessions receive their MCP servers per session over ACP**, computed by
-the collector for the session's (host, hat) and passed in `session/new` /
-`session/load` (spike; gateway §3.2). Agent config files are not involved.
+the gateway for the session's (host, hat) — including a freshly minted
+per-session token in the `Authorization` header — and passed in `session/new` /
+`session/load` (spike; gateway §3.2). Agent config files are not involved, and
+no host ever renders MCP entries into agent config in v1.
 
 For standalone mode and terminal sessions started outside roost, the gateway
-emits a **manifest** per principal (`[{name, url, headers}]`) and
-**renderers** turn it into agent config:
-
-- CLI, `roost mcp apply --client claude|codex`;
-- optionally host-side for the host's default hat (off by default, because a
-  global entry is visible to every hat on that host).
+emits a **manifest** per standalone client (`[{name, url, headers}]`) and the
+CLI renders it into agent config: `roost mcp apply --client claude|codex`, with
+the client token read from a file, an environment variable or stdin (never a
+command-line flag).
 
 Renderer rules:
 
@@ -739,8 +849,7 @@ Renderer rules:
   touch entries it does not own** (ownership marked in a way that survives the
   agent rewriting the file).
 - A semantic no-op leaves the file byte-identical.
-- The token travels in the URL path, so the entry is just a URL — no environment
-  variable has to be exported into future shells.
+- The token travels in a header entry, never in the URL.
 
 v1 renderers: **Claude Code and Codex**. Other agents get a generic "copy this
 JSON snippet" export.
@@ -762,20 +871,24 @@ gated by collector capabilities.
 ### 11.1 REST
 
 Resource-oriented JSON over HTTPS, types generated from the Rust message types (§5.4).
-Mutations that reach a host (prompt, cancel, answer, start) return `202` with an
-operation id when the host round trip is asynchronous; the outcome arrives over
-SSE.
+Mutations that reach a host return `202`; their outcome arrives over SSE. A
+prompt returns once the host has reported that the turn started; answers
+return once durably queued. Endpoints are listed in the subsystem specs.
+Timelines page from the tail (`before=`) or forward (`after=`); the session view
+opens at the tail.
 
 ### 11.2 SSE and resumption
 
-- The collector assigns every ingested event a **global monotonic `event_id`**.
-  SSE uses it as the event `id:`, and clients reconnect with
+- **Every state change first writes an events row**, which receives a
+  **global monotonic `event_id`**. Every SSE message carries the `event_id`
+  that caused it as its `id:`, and clients reconnect with
   `Last-Event-ID: <event_id>` for idempotent catch-up.
 - Two stream shapes: a **list stream** (session metadata changes across all
   sessions, used by the session list) and a **session stream** (full events for
-  one session). Both resume from `event_id`.
-- If the requested `event_id` is older than retained catch-up history, the
-  server tells the client to refetch the snapshot instead of silently skipping.
+  one session).
+- The session stream resumes directly from the events table, with no catch-up
+  limit. The list stream resumes within a 24-hour window; beyond it the server
+  tells the client to refetch the snapshot instead of silently skipping.
 
 *Rejected:* using the host's per-session `seq` as the SSE cursor. It is only
 unique within one session, so a multi-session stream cannot resume from it.
@@ -796,9 +909,9 @@ Refined in its own spec.
 | `roost host run` | Run a paired host. |
 | `roost host adapters update` | Move to the adapter set pinned by the installed release. |
 | `roost gateway` | Standalone MCP gateway. |
-| `roost mcp apply --client <agent>` | Render a gateway manifest into an agent config. |
-| `roost service install` | Write a launchd agent (macOS) or systemd user unit (Linux; warns about `loginctl enable-linger`). |
-| `roost doctor` | Diagnose: agent CLIs present and logged in, adapters start, collector reachable, credentials valid. |
+| `roost mcp apply --client <agent>` | Render a standalone client's gateway manifest into an agent config (token from a file, the environment or stdin). |
+| `roost service install --role up\|host\|collector` | Write a launchd agent (macOS) or one systemd user unit per role (Linux; warns about `loginctl enable-linger`). |
+| `roost doctor` | Diagnose: agent CLIs present and logged in, adapters start, collector reachable, credentials valid, restart pending after an upgrade. |
 
 Platforms v1: Linux amd64/arm64, macOS arm64. Windows via WSL only.
 
@@ -824,7 +937,11 @@ binaries, so Node may not be installed at all, and version-manager PATH setups
   aliases such as `opus` resolve to, so it is a product decision, not a detail.
 - Every pin bump passes a **live e2e gate** in CI (§14).
 - Advanced override: a custom adapter command in config — also the door for any
-  other ACP agent.
+  other ACP agent. An overridden agent drops to the mixed-host fallback (§8.5)
+  unless the operator accepts unverified isolation.
+- After a binary upgrade a host keeps using its installed adapter set, warns
+  that the pinned set differs, and switches at its next start (before accepting sessions) or on
+  `roost host adapters update` (distribution §3.2).
 - The pins and their hashes live in one manifest compiled into the binary;
   the host fetches each package tarball from the npm registry and verifies it
   (distribution §3). Nothing runs npm on the user's machine.
@@ -838,11 +955,11 @@ binaries, so Node may not be installed at all, and version-manager PATH setups
 
 ### 12.4 Backups
 
-Backup = a copy of the collector data directory: SQLite database, the gateway
-master key, and the Web Push (VAPID) key pair generated on first run. Without
-the master key, encrypted gateway credentials are unrecoverable; without the
-VAPID keys, every push subscription must be re-created. Both facts are
-documented next to the backup instructions.
+Backup = a copy of the collector data directory: SQLite database, prompt
+attachments, the gateway master key, and the Web Push (VAPID) key pair
+generated on first run. Without the master key, encrypted gateway credentials
+are unrecoverable; without the VAPID keys, every push subscription must be
+re-created. Both facts are documented next to the backup instructions.
 
 ---
 
@@ -858,22 +975,26 @@ documented next to the backup instructions.
     parked/closed filters, `blocked` marker.
   - **Session** — transcript, composer (text, images, slash commands),
     permission and elicitation cards, model/mode/effort bar, resume / cancel /
-    close.
+    park / close / delete.
   - **New session** — host, project (recents + browse), agent, model/mode/effort.
   - **Hosts** — pair, rename, revoke, versions, doctor results, online/offline.
   - **MCP** — the single place to add integrations: connections, OAuth
-    Connect, and per connection the hosts that receive it (backed by the
-    hat × host mount grid; clients instead of hosts in standalone mode).
-  - **Hats** — declare hats, path rules per host.
+    Connect, per connection the hosts that receive it (all hosts listed;
+    clients instead of hosts in standalone mode), and local stdio servers per
+    (host, hat).
+  - **Hats** — declare hats, path rules per host, purge a hat.
   - **Settings** — account, passkeys, push devices, `public_url`.
 - `gateway` mode shows only MCP and Settings: one app, views gated by collector
   capabilities.
 - Mobile-first PWA; Web Push on `blocked` and on turn end.
-- Markdown pipeline order is load-bearing: parse raw HTML → sanitize →
-  highlight (`rehype-raw → rehype-sanitize → rehype-highlight`), with unknown
-  code languages ignored rather than thrown. Highlighting output is trusted only
-  because it runs after sanitization.
-- Neutral, original visual identity; hats supply colour and logo.
+- Markdown pipeline order is load-bearing:
+  `remark-gfm → remark-breaks → rehype-sanitize → rehype-highlight`, with
+  unknown code languages ignored rather than thrown. Raw HTML in agent output
+  is not parsed; it renders as text. Highlighting output is trusted only
+  because it runs after sanitization, and the page's Content-Security-Policy
+  forbids inline scripts regardless.
+- Neutral, original visual identity; hats supply colour and a logo, served as
+  an image after server-side sanitization.
 
 ---
 
@@ -883,11 +1004,11 @@ documented next to the backup instructions.
 |---|---|---|
 | Protocol | Contract tests generated from the schema: every frame round-trips. Exhaustive dispatch is a compile-time property; CI fails on a diff in regenerated schema/TS types. | Hand-mirrored shapes drift silently (§5.4). |
 | Transport parity | The same scenarios run over the in-memory pipe and a real WebSocket. | One code path must stay tested in both deployments (§3.3). |
-| Session behaviour | Deterministic **fake ACP adapter**: scripted replies, permissions, elicitation, replay on `session/load`. Scenarios: WS drop, collector restart, host restart, outbox resend, seq dedup, outbox overflow → gap, reaper vs. blocked, answer delivered vs. dropped, multi-client answer. | Every failure row in §6.6 gets a test. |
-| Live e2e gate | Real `claude-agent-acp` and `codex-acp` on every adapter pin bump: start, prompt, tool call, permission, elicitation, resume. | In the predecessor only a live call caught a wrongly shaped capability that the SDK silently discarded; unit tests asserted our JSON against our own assumption. |
-| Gateway | Streaming test (first chunk arrives before upstream finishes; must fail, not hang, on a buffering proxy). Fake OAuth server: discovery, DCR, PKCE, refresh, single-flight, 401 → 502. Renderer tests on real Claude and Codex config files: foreign entries untouched, no-op is byte-identical. | Each is a known failure class. |
-| Hats | **Negative tests**: a hat-A principal requesting a hat-B connection gets 404; hat-B recents never appear for hat A. Table-driven path-rule resolution (segment match, longest prefix, normalisation). | Isolation is only real if its violation is tested. |
-| Auth | Setup link single use and expiry; trusted-proxy header rejected from a non-proxy peer; revoked host rejected distinctly; `Origin` enforcement on SSE/WS. | |
+| Session behaviour | Deterministic **fake ACP adapter**: scripted replies, permissions, elicitation, replay on `session/load`. Scenarios: WS drop, collector restart, host restart, reconciliation only after `resend_complete`, seq fast-forward, seq conflict, outbox resend, outbox overflow → gap without losing state frames, reaper vs. blocked, answer queued while offline, answer delivered vs. dropped. Full list in ACP core §12. | Every failure row in §6.6 gets a test. |
+| Live e2e gate | Real `claude-agent-acp` and `codex-acp` on every adapter pin bump: start, prompt, tool call, permission, elicitation, resume, per-session MCP isolation, and whether the gateway token is visible in the process list (recorded, gateway §3.2). | In the predecessor only a live call caught a wrongly shaped capability that the SDK silently discarded; unit tests asserted our JSON against our own assumption. |
+| Gateway | Streaming test (first chunk arrives before upstream finishes; must fail, not hang, on a buffering proxy). Fake OAuth server: discovery, DCR, PKCE, refresh, single-flight, 401 → 502, flow cookie binding. Egress policy: redirects refused, private and metadata addresses denied. Renderer tests on real Claude and Codex config files: foreign entries untouched, no-op is byte-identical. | Each is a known failure class. |
+| Hats | **Negative tests**: a hat-A session token requesting a hat-B connection gets 404; a revoked session token gets 404; hat-B recents never appear for hat A; resume refused when the hat no longer matches. Table-driven path-rule resolution (segment match, longest prefix, normalisation). | Isolation is only real if its violation is tested. |
+| Auth | Setup link single use and expiry, printed only to a terminal; revoked host rejected distinctly; second host connection rejected; `Origin` rules per route; step-up required on every listed action; CSP header on every HTML response. | |
 | Frontend | Component tests (vitest). **Playwright** on main flows: setup → pair host → start session → permission → push. | jsdom cannot verify layout, focus or real rendering. |
 | Guards | **Revert probe**: every guard is shown to fail its test when removed, with both runs recorded in the PR. | A test nobody watched fail may pass for the wrong reason. |
 
@@ -908,6 +1029,8 @@ hermetic package builds stay green.
 | Config explorer | Later | Host capability flag. |
 | LLM auto-naming | Later | `title` is already host- or operator-set. |
 | OIDC login | Later | Auth module seam next to passkeys. |
+| Identity from a fronting proxy | Later | Signed assertions only (e.g. a Cloudflare Access JWT); never a bare header (§7.1). |
+| Host-side rendering of MCP entries into agent config | Not v1 | `roost mcp apply` with a standalone client covers terminal use. |
 | Teams / multiple operators | Later | `owner_id` on every row. |
 | Built-in ACME | Not v1 | Reverse proxy / Tailscale documented instead. |
 | Windows native | Not v1 | WSL. |
@@ -924,7 +1047,8 @@ Resolved since the first draft:
 - *Per-project / per-session MCP config* — measured in
   [the spike](../spikes/2026-09-25-per-session-mcp.md): roost sessions receive
   MCP servers per session over ACP (Claude with a strict-MCP flag, Codex with a
-  composed `CODEX_HOME`). See gateway §3.2 and ACP core §6.
+  composed `CODEX_HOME`, pending the concurrency gate below). See gateway §3.2,
+  ACP core §6 and §8.5 here.
 - *Implementation language* — Rust (§9.1).
 - *ACP Rust SDK coverage* — use the crate's connection engine with raw payload
   handlers (ACP core §2.4).
@@ -939,7 +1063,16 @@ Still open:
    the same niche (one owns crates.io `roost` and ships a `roost` binary via its
    own Homebrew tap). Details and consequences in distribution §11; keeping or
    changing the name is the operator's decision.
-2. Subsystem-level open questions are listed at the end of each subsystem spec.
+2. **Per-hat "isolate agent user config".** Whether a hat can keep its sessions
+   from loading the user's own agent configuration (§8.4); ACP core open
+   question 2.
+3. **Concurrent Codex processes sharing a composed home** — must be measured
+   before Codex leaves the fallback on mixed hosts (§8.5); ACP core open
+   question 3.
+4. **`master.key` in the OS keystore** instead of a file (kernel open
+   questions).
+5. Other subsystem-level open questions are listed at the end of each
+   subsystem spec.
 
 ---
 

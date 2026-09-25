@@ -3,7 +3,7 @@
 - **Date:** 2026-09-26
 - **Status:** Draft, awaiting review
 - **Refines:** [architecture spec](2026-09-25-roost-architecture-design.md) §8
-  (hats) and §10 (gateway). Disagreements with the umbrella are listed in §13.
+  (hats) and §10 (gateway).
 - **Evidence:** [per-session MCP spike](../spikes/2026-09-25-per-session-mcp.md)
   and a behaviour catalogue of the predecessor's gateway, which ran against
   real vendors (Notion, Atlassian, Miro, Datadog, Figma, Slack). "G-n" marks a
@@ -22,9 +22,12 @@ streaming proxy and the manifests that tell agents where to connect.
    authenticates (token, OAuth, or none). Each connection belongs to one hat;
    the default is the hat currently selected in the UI.
 2. **Connect** (OAuth only): a popup completes consent once, on the collector.
-3. **Tick hosts.** The grid shows hosts of that hat's scope; a tick is a mount.
-4. **Next session** on a ticked host has the integration's tools. The UI says
-   "applies to new and resumed sessions".
+3. **Tick hosts.** The grid lists **every host** for every connection (a mixed
+   host isolates per session, so no host is out of a hat's scope); a tick is a
+   mount. Where a host falls back to default-hat mounts for an agent (umbrella
+   §8.5), the grid says so.
+4. **Next session** on a ticked host, in the connection's hat, has the
+   integration's tools. The UI says "applies to new and resumed sessions".
 
 The operator never sees client tokens, never edits agent config files, and
 never repeats consent per machine.
@@ -38,21 +41,31 @@ gw_connections(
   id TEXT PK, owner_id, slug UNIQUE, label, url, hat_id,
   cred_kind,               -- none | static | oauth_dcr | oauth_client
   tool_allowlist JSON,     -- null = all tools
+  internal_network BOOL,   -- operator allows non-public upstream addresses (§5.7)
   status,                  -- not_connected | ok | needs_auth | error
-  status_note, status_at, created_at, updated_at)
+  status_note, account_label NULL, status_at, created_at, updated_at)
 gw_credentials(
   connection_id PK, key_version, ciphertext BLOB,   -- AEAD, §6
   expires_at, updated_at)
 gw_mounts(connection_id, host_id, PRIMARY KEY(connection_id, host_id))
-gw_clients(
-  id TEXT PK, owner_id, kind,       -- host_hat | standalone
-  host_id NULL, hat_id, label,
+gw_session_tokens(                  -- one per session, minted at every start/resume
+  session_id PK, owner_id, host_id, hat_id, token_hash,
+  created_at, last_used_at, revoked_at)
+gw_clients(                         -- standalone clients only
+  id TEXT PK, owner_id, hat_id, label,
   token_hash, created_at, last_used_at, revoked_at)
+gw_client_pins(client_id, connection_id, PRIMARY KEY(client_id, connection_id))
 gw_oauth_clients(                   -- registered or pre-registered OAuth clients
   connection_id PK, token_endpoint, authorization_endpoint, issuer,
   client_id, client_secret_ciphertext NULL, redirect_uri, scopes JSON,
-  resource, registered_at)
+  resource, resource_param_accepted BOOL, registered_at)
+gw_stdio_servers(                   -- §3.4
+  id TEXT PK, owner_id, host_id, hat_id, name, command, args JSON,
+  env_ciphertext NULL, created_at, updated_at)
 ```
+
+`gw_mounts` has no hat column: the hat is the connection's. `gw_session_tokens`
+holds session ids as opaque values; the gateway never reads session tables.
 
 - **`cred_kind`:**
   - `none` — no credential (public or network-trusted upstreams).
@@ -71,6 +84,9 @@ gw_oauth_clients(                   -- registered or pre-registered OAuth client
   two connections with separate grants (umbrella §8.3).
 - **Slugs:** `^[a-z0-9][a-z0-9-]{0,47}$`, unique per installation. They become
   MCP server names (`roost-<slug>`) and URL segments.
+- **Hat purge** (kernel §5.5): the gateway's purge hook deletes the hat's
+  connections with their credentials, OAuth clients and mounts, its session
+  tokens, standalone clients and stdio servers.
 
 ---
 
@@ -80,57 +96,92 @@ gw_oauth_clients(                   -- registered or pre-registered OAuth client
 
 | Principal | Created | Scope |
 |---|---|---|
-| `host_hat` | automatically, one per (host, hat) the first time a session of that hat starts on that host | connections of that hat mounted on that host |
-| `standalone` | manually in standalone mode (`roost gateway`) or for tools outside roost | a list of connections pinned to the client |
+| session | automatically, by `SessionMcp::servers_for` at every start and resume of a session (ACP core §1) | connections of the session's hat mounted on the session's host |
+| `standalone` client | manually in standalone mode (`roost gateway`) or for tools outside roost | the connections pinned to the client (`gw_client_pins`) |
 
-- Tokens are 32 random bytes, stored as SHA-256 hashes, shown once (standalone)
-  or delivered only to the host that owns them.
-- **Scope is derived from the token, never from anything the request claims.**
-  An unknown token, a revoked token, an unmounted connection, or a connection of
-  another hat all return **404** (not 403: do not confirm existence).
-- Revoking a host revokes its `host_hat` clients.
+- Tokens are 32 random bytes, stored only as SHA-256 hashes. A standalone
+  token is shown once; a session token exists in plaintext only inside the
+  `start_session` / `resume_session` frame for that session's host.
+- **One token per session.** It is revoked on park, close, adapter exit and
+  host revoke (`SessionMcp::revoke`), and superseded by the token minted at the
+  next resume. A presumed park while the host is merely offline does not revoke
+  it (ACP core §4.8).
+- **Scope is checked at request time** from the token's (host, hat) and the
+  mounts as they are now, never from anything the request claims. An unknown
+  token, a revoked token, an unmounted connection, or a connection of another
+  hat all return **404** (not 403: do not confirm existence).
+- Tokens are never logged, and the `headers` of `mcp_servers` entries never
+  appear in timeline events or SSE (ACP core §8).
 
 ### 3.2 Delivery to roost sessions (primary path)
 
 Per the spike, roost-driven sessions get their MCP servers **per session over
 ACP**, not through agent config files:
 
-1. When the collector sends `start_session` / `resume_session` (ACP core §3.3)
-   it computes the session's `mcp_servers`: every connection of the session's
-   hat mounted on the session's host, as
+1. When the collector prepares `start_session` / `resume_session` (ACP core
+   §3.3) it calls `SessionMcp::servers_for(host, hat, session)`, which mints the
+   session token and returns every connection of the session's hat mounted on
+   the session's host, as
    `{type: "http", name: "roost-<slug>", url: "<public_url>/mcp/<slug>",
-   headers: [{name: "Authorization", value: "Bearer <host_hat token>"}]}`.
+   headers: [{name: "Authorization", value: "Bearer <session token>"}]}`,
+   followed by the stdio servers for that (host, hat) (§3.4).
 2. The host passes them in `session/new` / `session/load`, with the agent's
-   isolation mechanism (Claude strict flag, Codex composed home; ACP core §6).
+   isolation mechanism (Claude strict flag, Codex composed home; ACP core §6),
+   or applies the fallback (umbrella §8.5).
 3. A mount change affects the **next** start or resume of a session on that
-   host.
+   host; a removed mount is refused at request time immediately.
 
 **Token in a header, not the URL.** *(G-2: the predecessor put the token in
 the URL path because one agent's CLI could not take a header from its config
-at the time. URLs end up in logs, process listings and agent transcripts;
-headers in an ACP request do not. Both agents accept headers for HTTP MCP
-servers in ACP `session/new`, and Codex's config supports `http_headers`.)*
+at the time. URLs end up in logs and agent transcripts. Both agents accept
+headers for HTTP MCP servers in ACP `session/new`, and Codex's config supports
+`http_headers`.)*
+
+**Measured limit: the token is visible in the process list.** The Claude
+adapter's SDK passes `mcpServers` to the Claude CLI as `--mcp-config <JSON>` on
+the command line, headers included, so another local user of that machine can
+read a live session's token from the process list. Per-session tokens limit
+the blast radius to live sessions of that host and hat. **Hosts shared with
+untrusted local OS users are unsupported for hats with gateway connections**,
+and the documentation says so. A live gate (ACP core §12) searches the process
+list for the token on every adapter pin; for Codex the exposure is
+unmeasured.
 
 ### 3.3 Delivery outside roost sessions (renderers)
 
 For standalone mode, or for terminal sessions the operator starts without
-roost, the gateway emits a **manifest** per principal
+roost, the gateway emits a **manifest** per standalone client
 (`[{name, url, headers}]`) and a renderer writes it into agent config:
 
-- `roost mcp apply --client claude|codex [--token …]` (standalone), or
-- `roost host mcp apply` on a host, rendering that host's default-hat mounts
-  (opt-in; off by default, because a global entry is visible to every hat on
-  the host and every terminal session — the operator is told this when
-  enabling it).
+- `roost mcp apply --client claude|codex`, with the client token read from a
+  file (`--token-file`), the `ROOST_MCP_TOKEN` environment variable or stdin —
+  never a command-line flag (it would show in the process list).
 
-Renderer rules (§8).
+Hosts never render MCP entries into agent config in v1. Renderer rules (§8).
+
+### 3.4 Local stdio servers
+
+roost's per-session isolation strips the user's own locally configured MCP
+servers from roost sessions, and the gateway proxies only HTTP. So the MCP view
+also holds, per **(host, hat)**, a list of local stdio servers
+(`name`, `command`, `args`, `env`; names follow the slug rules and share
+the slug namespace). The collector stores them (`env` encrypted
+like credentials, §6) and passes them to sessions of that hat on that host as
+ACP stdio `mcpServers` entries, named `roost-<name>`. They run on the host as
+the agent's child processes and are not proxied. Editing them requires step-up
+authentication (kernel §3.4), since they are commands the host will execute.
 
 ---
 
 ## 4. OAuth
 
 Built on `rmcp`'s `auth` module (discovery, registration, PKCE, refresh), with
-roost supplying the credential store, the flow state, and the policies below.
+roost supplying the credential store, the flow state, the HTTP client and the
+policies below. Every discovery, registration and token request goes through
+the egress policy (§5.7): no redirects are followed, non-public addresses are
+refused unless the connection is marked "internal network", and every
+authorization-server metadata and endpoint URL must be `https` (loopback
+`http` allowed).
 
 ### 4.1 Discovery
 
@@ -182,14 +233,27 @@ rejected — a grant that "refreshes fine and never works".)*
 ### 4.3 Consent and exchange
 
 - PKCE S256 only; refuse servers that do not advertise S256.
-- Consent URL carries `resource=<connection URL>` (RFC 8707) and the scopes.
+- Consent URL carries `resource=<connection URL>` (RFC 8707) and the scopes,
+  and must be `https`. If the authorization server rejects the `resource`
+  parameter, the flow is retried once without it and
+  `resource_param_accepted = false` is recorded on the connection (and used for
+  exchange and refresh).
 - Flow state: in memory, keyed by `state`, single use, 15-minute TTL. The
   callback rejects an unknown `state` before touching storage and uses only
   values snapshotted when the flow started. *(G-8: a concurrent second authorize
   could swap the client under a callback that re-read it from storage.)*
+- **Flow binding:** starting a flow sets a `SameSite=Lax`, `HttpOnly`,
+  `Secure` flow cookie bound to its `state`; the callback requires the cookie
+  to match, so a consent completed in another browser cannot be attached to
+  the operator's connection.
+- The popup is opened blank inside the click handler with `opener` set to
+  `null`, then navigated to the consent URL (frontend spec §8).
 - The exchange sends `code_verifier` and `resource`. Token-endpoint error
   bodies are never logged or echoed (they can repeat the code).
 - The grant is stored **under the connection's refresh lock** (§4.5).
+- After connecting, the MCP view shows the account identity the vendor
+  reports, if any (`account_label`), so the operator can confirm the right
+  account was connected.
 - Vendor error text shown to the operator is truncated to 300 characters and
   rendered as text.
 
@@ -254,6 +318,10 @@ the principal's scope (§3.1). Otherwise 404. The request body is capped at
 - **Response headers forwarded:** `Content-Type`, `Mcp-Session-Id`,
   `Cache-Control`. Everything else is dropped, including `Set-Cookie` and
   `WWW-Authenticate`. *(G-15: the predecessor passed `Set-Cookie` through.)*
+  The gateway always adds `X-Content-Type-Options: nosniff`, and forwards only
+  `application/json` and `text/event-stream` bodies; any other upstream content
+  type becomes a 502.
+- Upstream redirects are never followed (§5.7).
 - **Sessions:** `Mcp-Session-Id` passes through in both directions, so each
   downstream client session maps to its own upstream session and the gateway
   holds no session table. `DELETE` is forwarded so client terminations reach
@@ -308,6 +376,21 @@ code passed the client's `initialize` through verbatim.)*
 Other methods (including ones the gateway does not know, like
 `server/discover`) are forwarded unchanged.
 
+### 5.7 Egress policy and limits
+
+The proxy, every OAuth HTTP client and Web Push delivery share one outbound
+HTTP policy, which lives in the kernel (kernel §7.1) so that push delivery can
+use it without depending on the gateway:
+
+- **Redirects are never followed.**
+- DNS is resolved by roost and the address checked before connecting;
+  loopback, link-local (including `169.254.169.254`), RFC 1918, unique-local
+  IPv6 and other non-public ranges are refused — unless the operator has marked
+  the connection **"internal network"**, which allows them for that connection
+  only. Web Push endpoints are always public-only.
+- Per connection, a cap on concurrent upstream requests and on idle streaming
+  responses; beyond it the proxy answers 503.
+
 ---
 
 ## 6. Credentials at rest
@@ -325,8 +408,14 @@ Other methods (including ones the gateway does not know, like
   (umbrella §12.4). *(G-20: the predecessor stored credentials in plaintext.)*
 
 **Stated plainly in the docs:** the collector holding the gateway is a single
-point of compromise for every integration it holds. Hats limit what one host's
-token reaches; they do not protect against compromise of the collector.
+point of compromise for every integration it holds. Hats limit what one
+session's token reaches; they do not protect against compromise of the
+collector. In the default `roost up` install the collector runs as the same OS
+user as every agent, so any agent can read `master.key` and `roost.db` and
+decrypt every grant. Whenever the gateway holds credentials for more than one
+hat, the collector should run as a separate OS user or in a container (the
+Docker image); `roost up` warns in that situation (kernel §10). Keeping
+`master.key` in the OS keystore is an open question (kernel §12).
 
 ---
 
@@ -385,31 +474,36 @@ token reaches; they do not protect against compromise of the collector.
 
 ## 9. API
 
-All operator endpoints require an operator session.
+All operator endpoints require an operator session. Endpoints marked
+**step-up** also require a fresh passkey or password check (kernel §3.4).
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/mcp/connections` | List (no secrets; `has_credential`, status, mounts). |
-| `POST /api/mcp/connections` | Create. |
-| `PATCH /api/mcp/connections/{id}` | Update; origin or kind change clears credentials (§4.6). |
+| `GET /api/mcp/connections` | List (no secrets; `has_credential`, status, `account_label`, mounts). |
+| `POST /api/mcp/connections` | Create (**step-up**). |
+| `PATCH /api/mcp/connections/{id}` | Update (**step-up** when the URL, credential kind or `internal_network` changes); origin or kind change clears credentials (§4.6). |
 | `DELETE /api/mcp/connections/{id}` | Delete with mounts, credential, OAuth client. |
 | `PUT /api/mcp/connections/{id}/mounts` | Replace the host set (full set, never a delta). |
-| `PUT /api/mcp/connections/{id}/credential` | Set a static token (write-only, 204). |
-| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client. |
-| `POST /api/mcp/connections/{id}/authorize` | Start OAuth; returns the consent URL. |
-| `GET /api/mcp/oauth/callback` | OAuth redirect target (state-authenticated). |
-| `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients (token shown once on create). |
-| `GET /api/mcp/manifest` | Manifest for the presenting client token (renderers). |
+| `PUT /api/mcp/connections/{id}/credential` | Set a static token (write-only, 204; **step-up**). |
+| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**). |
+| `POST /api/mcp/connections/{id}/authorize` | Start OAuth; sets the flow cookie, returns the consent URL. |
+| `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie). |
+| `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; **step-up** on `PUT`). |
+| `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients. `POST {label, hat_id, connection_ids[]}` creates the client and its pins; the token is shown once. |
+| `PUT /api/mcp/clients/{id}/pins` | Replace a client's pinned connections (`{connection_ids[]}`). |
+| `GET /api/mcp/manifest` | Manifest for the presenting standalone client token (renderers). |
 
-No endpoint lets one host read another host's tokens. *(G-25: the
-predecessor's pull endpoint took the target machine from the path behind a
-shared token, so any host could read any other host's token.)* Host tokens
-reach hosts only inside the `start_session`/`resume_session` frames for that
-host, over the authenticated host connection.
+No endpoint returns a session token, and no endpoint lets one host read another
+host's tokens. *(G-25: the predecessor's pull endpoint took the target machine
+from the path behind a shared token, so any host could read any other host's
+token.)* Session tokens reach a host only inside the
+`start_session`/`resume_session` frames for that session, over the
+authenticated host connection.
 
-The consent popup is opened blank inside the click handler and navigated when
-the authorize call returns (`noopener` makes `window.open` return `null`;
-opening after an `await` is blocked). Frontend spec.
+The consent popup is opened blank inside the click handler, its `opener` set to
+`null`, and navigated when the authorize call returns (passing `noopener` to
+`window.open` makes it return `null`; opening after an `await` is blocked).
+Frontend spec §8.
 
 ---
 
@@ -417,8 +511,8 @@ opening after an `await` is blocked). Frontend spec.
 
 `roost gateway` runs the kernel (operator auth, storage, HTTP) and this crate
 only. `ClientIdentity` resolves standalone client tokens, `MountPolicy` reads
-the client's pinned connection list, `Notifier` logs and calls an optional
-webhook. The frontend shows only the MCP and Settings views. The build proves
+the client's pins (`gw_client_pins`), `Notifier` logs and calls an optional
+webhook. There are no session tokens and no stdio servers. The frontend shows only the MCP and Settings views. The build proves
 the boundary: the `roost-gateway` crate does not depend on `roost-sessions`.
 
 ---
@@ -432,12 +526,20 @@ the boundary: the `roost-gateway` crate does not depend on `roost-sessions`.
   non-401 errors pass through.
 - **Fake OAuth server:** PR discovery (challenge, path-inserted, origin),
   AS metadata forms, DCR success and refusal text, pre-registered confidential
-  client, PKCE verification, `resource` on consent/exchange/refresh, rotating
-  refresh tokens with reuse detection (concurrent 401s share one refresh),
-  refresh without a new refresh token, caller cancellation mid-refresh.
-- **Scope negative tests:** a `host_hat` token for hat A requesting a hat-B
-  connection → 404; unmounted connection → 404; revoked token → 404; standalone
-  client outside its pin list → 404.
+  client, PKCE verification, `resource` on consent/exchange/refresh and the
+  retry without it, rotating refresh tokens with reuse detection (concurrent
+  401s share one refresh), refresh without a new refresh token, caller
+  cancellation mid-refresh; callback without the matching flow cookie refused;
+  `http` metadata endpoints refused.
+- **Egress:** redirects not followed (proxy and OAuth); loopback, link-local,
+  metadata-service and private addresses refused unless the connection is
+  marked internal; per-connection concurrency cap; proxy responses carry
+  `nosniff` and other content types become 502.
+- **Scope negative tests:** a session token for hat A requesting a hat-B
+  connection → 404; unmounted connection → 404; token of a parked, closed or
+  superseded session → 404; standalone client outside its pins → 404.
+- **Token hygiene:** no token or `mcp_servers` header appears in logs, events
+  or SSE output.
 - **Allowlist:** JSON and SSE `tools/list` filtering, batch, empty result `[]`,
   blocked `tools/call`.
 - **Capabilities:** `initialize` upstream lacks `sampling`/`elicitation`/`roots`.
@@ -485,17 +587,7 @@ the boundary: the `roost-gateway` crate does not depend on `roost-sessions`.
 
 ---
 
-## 13. Changes to the umbrella spec
-
-- §10.1 "proxy `/mcp/<client-token>/<slug>`" → `/mcp/<slug>` with the client
-  token in `Authorization` (§3.2).
-- §10.1 "one upstream session per (connection × client)" → per downstream MCP
-  session via `Mcp-Session-Id` passthrough (§5.2); finer and stateless.
-- §10.3 renderers are secondary: roost sessions receive servers over ACP
-  (§3.2); renderers serve standalone and terminal use (§3.3).
-- §4 data model: `cred_kind` gains `oauth_client`; `gw_oauth_clients` added.
-
-## 14. Open questions
+## 13. Open questions
 
 1. **Vendor coverage.** Measured behaviour exists for six vendors, but token
    lifetimes, rotation and reuse detection were never observed over days.

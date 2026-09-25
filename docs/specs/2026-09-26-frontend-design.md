@@ -25,8 +25,8 @@ is mobile-first, installable as a PWA, and is the only place that renders ACP.
 | Styling | CSS Modules + design tokens as CSS custom properties | Component-scoped styles cannot be overridden by an unrelated unconditional rule. *(F-1: a bare `display:none` after a media query hid a mobile control for a month; F-2: a CSS reset silently removed markdown list markers.)* |
 | roost types | TypeScript generated from `roost-proto` (`ts-rs`) | Umbrella §5.4. |
 | ACP types | `@agentclientprotocol/sdk`, pinned to the version the pinned adapters bundle | The frontend is the only other place that understands ACP. |
-| Markdown | `react-markdown` + `remark-gfm` + `remark-breaks` + `rehype-raw` → `rehype-sanitize` → `rehype-highlight {ignoreMissing}` | Order is load-bearing (§6.4). |
-| Tests | Vitest + Testing Library; Playwright (desktop and mobile viewports) | §13. |
+| Markdown | `react-markdown` + `remark-gfm` → `remark-breaks` → `rehype-sanitize` → `rehype-highlight {ignoreMissing}` | Order is load-bearing; raw HTML is not parsed (§6.4). |
+| Tests | Vitest + Testing Library; Playwright (desktop and mobile viewports) | §12. |
 
 *Rejected:* a utility-CSS framework with a global reset. The predecessor's two
 worst styling bugs (F-1, F-2) were both cascade effects of global rules that no
@@ -45,7 +45,7 @@ test saw.
 | `/new` | New session | no |
 | `/hosts` | Hosts: pair, rename, revoke, versions, doctor, online state | no |
 | `/mcp` | Connections, OAuth, mounts (clients in `gateway` mode) | yes |
-| `/hats` | Hats, themes, default hat per host, path rules | no |
+| `/hats` | Hats, themes, default hat per host, path rules, purge | no |
 | `/settings` | Account, passkeys, push devices, `public_url`, per-hat push policy | yes |
 
 - `GET /api/capabilities` tells the app which views exist; routes not offered
@@ -68,6 +68,9 @@ test saw.
 - **Login:** passkey first (conditional UI where supported), password second.
 - A 401 from any API call routes to `/login` with the current URL as the return
   target.
+- **Step-up:** a 403 `step_up_required` (kernel spec §3.4) opens a small
+  dialog (passkey first, password second) and, on success, retries the
+  original request once. Nothing else is lost; forms keep their input.
 
 ---
 
@@ -81,9 +84,11 @@ test saw.
   refetched the full list on every SSE event, including every streamed message
   chunk, from every open tab; with ~600 sessions the list payload reached
   5.6 MB before catalogues were moved out.)*
-- **Session:** opening a session fetches its detail and first timeline page,
-  then opens the session SSE stream and **appends** events, folding
-  incrementally (§6.1). No per-event timeline refetch.
+- **Session:** opening a session fetches its detail and the **tail** of its
+  timeline (`events` without `before`), then opens the session SSE stream from
+  the last `event_id` and **appends** events, folding incrementally (§6.1).
+  Scrolling up loads older pages with `before=<oldest event_id>`. No
+  per-event timeline refetch.
 - **Catalogue** (config options, commands, plan): fetched on open, refreshed on
   `catalog_changed`. Never shown for the wrong session while loading.
 - **Resume:** both streams reconnect with `Last-Event-ID`. The UI shows a
@@ -100,7 +105,7 @@ test saw.
 ### 4.2 Keys
 
 List items, transcript items and cards are keyed by stable ids
-(`session_id`, `event_id`, ACP `toolCallId`, `request_id`), never by array
+(`session_id`, `event_id`, ACP `toolCallId`, `pending_id`), never by array
 index, so card-local state (a half-filled form) cannot move to another item.
 
 ---
@@ -160,11 +165,14 @@ such:
   string, `rawOutput` as `[{type, text}]`, `content[]` text blocks, and legacy
   `_meta` tool responses. *(F-12: a schema change between adapter versions made
   shell output render empty.)*
-- User turns render from the collector's user-turn events, including stored
+- User turns render from the collector's `user_turn` events, including stored
   image attachments.
 - `plan` updates replace the step list (latest snapshot).
-- `host_note` events render as dividers (`adapter_exited` with a stderr excerpt
-  behind a disclosure, `transcript_gap`, `turn_interrupted`).
+- Non-ACP session bodies and collector events render as dividers:
+  `adapter_exited` (stderr excerpt behind a disclosure), `transcript_gap`,
+  `turn_ended{interrupted}` ("the turn was interrupted"), `session_parked`
+  with its reason, `host_note`, `conflict`, and operator actions (rename, hat
+  re-assignment).
 - **Fabrication warning:** tool output that contains tool-invocation syntax
   (closed tags only: `<tool_use>`, not `<tool_use`, so a legitimate
   `<tool_use_error>` does not trip it) gets a visible warning. *(F-13: a
@@ -184,9 +192,10 @@ predecessor labelled Codex sessions "Claude".)*
 
 ### 6.3 Cards
 
-**Actionability comes from the collector's pending-request set**
-(`pending_changed` on the session stream), not from position in the
-transcript. *(F-15: "last card wins" assumed one request at a time.)*
+**Actionability comes from the collector's pending set** (`pending_changed`
+on the session stream), not from position in the transcript. Cards and
+answers are keyed by `pending_id`. *(F-15: "last card wins" assumed one
+request at a time.)*
 
 Permission card:
 
@@ -211,20 +220,23 @@ Both cards, delivery states:
 | State | Shown |
 |---|---|
 | pending, live | buttons / form |
-| answered locally, no verdict yet | "Sent" |
+| answer queued, no verdict yet | "Sent" (plus "delivers when the host reconnects" while the host is offline) |
 | `delivered` | "Answered" |
-| `dropped` | "Sent, but the agent was no longer waiting" |
+| verdict `delivered: false` | "Sent, but the agent was no longer waiting" |
 | `cancelled(reason)` | "The agent stopped waiting (<reason>)" plus "Answer as a new message" |
+| 409 `already_answered` | "Already answered from another device" (the card then follows the other answer's verdict) |
 
-The verdict fold is monotonic: `delivered` sticks even if a later `dropped`
-arrives from another client. "Answer as a new message" resumes the session if
+The verdict fold is monotonic: `delivered` sticks even if a later
+`delivered: false` arrives. "Answer as a new message" resumes the session if
 needed and sends "You asked: …. My answer: …" as a new turn, labelled as such.
 
 ### 6.4 Rendering
 
-- Markdown pipeline as in §1; links open in a new tab with
-  `rel="noopener noreferrer"`; list markers are styled explicitly and a
-  Playwright check asserts they are visible.
+- Markdown pipeline as in §1. **Raw HTML in agent output is not parsed** (no
+  `rehype-raw`): it renders as literal text. The page's Content-Security-Policy
+  (kernel spec §7.2) blocks inline script regardless.
+- Links open in a new tab with `rel="noopener noreferrer"`; list markers are
+  styled explicitly and a Playwright check asserts they are visible.
 - Unknown code fence languages never throw (`ignoreMissing`).
 - **Every transcript item and card sits inside its own error boundary**; one
   bad item renders "could not render this item" and the rest of the transcript
@@ -236,7 +248,9 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
 
 - Text area, ⌘/Ctrl+Enter sends, Enter inserts a newline (mobile: a Send
   button).
-- **Images:** paste, drop or pick; png/jpeg/gif/webp ≤ 5 MiB, ≤ 20 per prompt.
+- **Images:** paste, drop or pick; png/jpeg/gif/webp ≤ 5 MiB each, ≤ 20 and
+  ≤ 16 MiB in total per prompt; hidden when the host lacks the `images`
+  capability.
   Each attachment inserts an `[Image #N]` marker at the cursor (all markers of
   one action spliced at once). The text is the source of truth: only images
   whose marker is still present are sent. Content is sent as ordered ACP
@@ -248,6 +262,10 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
   a stable order); optimistic with rollback on error.
 - Send is disabled while a turn is in flight (`running`/`blocked`); a Cancel
   control replaces it.
+- A 409 `not_attached` (the session is parked or its host offline) keeps the
+  draft and offers "Resume and send". A 503 "delivery unknown" keeps the draft
+  and shows that the outcome will be known when the host reconnects; a turn
+  later reported `not_delivered` offers to send its content again.
 - **Per-session state is keyed by session id**: draft text, attachments,
   scroll anchor and rename draft. Drafts persist per session in
   `sessionStorage`. *(F-17 (read): the predecessor's composer kept its draft
@@ -255,9 +273,13 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
 
 ### 6.6 Parked, failed, closed
 
-- Parked or closed: a footer with "Resume" (and "host offline" when presumed).
+- Parked or closed: a footer with "Resume" (and "host offline" when presumed),
+  and "Park" in the header menu for active sessions on hosts with the `park`
+  capability. A resume refused with `hat_mismatch` names both hats and links to
+  hat re-assignment (sessions with no running adapter, with a warning).
 - Failed: the reason and, for `agent_has_no_record`, "Start a new session in
   this project"; for `agent_not_logged_in`, the host's login instructions.
+- "Delete session" in the header menu (confirmation plus step-up).
 
 ---
 
@@ -275,7 +297,12 @@ One form, one request (`POST /api/sessions`):
   path.
 - **Resolved hat preview:** the form shows which hat the chosen path resolves
   to (server-side resolution), before the session starts.
-- **Agent** and **config axes** from the host's cached agent catalogue.
+- **Agent** and **config axes** from the host's agent catalogue
+  (`GET /api/hosts/{id}/agents`; the profile's static defaults until the first
+  session on that host refines them).
+- **MCP note:** when the host falls back to default-hat mounts for the chosen
+  agent and hat (umbrella §8.5), the form says the session will run without
+  gateway MCP servers.
 - **First prompt** (optional), same composer rules as §6.5.
 - Changing the host resets agent, axes, path and browse state; a silently
   downgraded choice shows a notice.
@@ -284,27 +311,41 @@ One form, one request (`POST /api/sessions`):
 
 ## 8. Hosts, MCP, Hats, Settings
 
-- **Hosts:** "Add host" shows a one-time code and the exact command
+- **Hosts:** "Add host" (step-up) shows a one-time code and the exact command
   (`roost host join <public_url> <code>`), with a countdown. The list shows
   online state, versions (host, adapters), agent availability, last doctor
-  result, rename and revoke (with confirmation).
-- **MCP:** connection list with status; add/edit form per `cred_kind`
-  (static token write-only; pre-registered client id/secret; the redirect URI
-  to register at the vendor); **Connect** opens the consent popup blank inside
-  the click handler and navigates it after the authorize call returns, keeping
-  the URL visible as a link if the popup is blocked *(F-18: `noopener` makes
-  `window.open` return `null`, so every attempt looked blocked)*; a host grid
-  per connection (mounts saved as a full set); a persistent note that changes
-  apply to new and resumed sessions. Vendor error text renders as text.
-- **Hats:** create, rename, theme (colour; logo as an uploaded SVG rendered
-  inline so it can use `currentColor`, or a PNG), default hat per host, path
-  rules per host with a live "this path resolves to" tester.
+  result, rename and revoke (confirmation plus step-up; the dialog says the
+  host's running agents stop only when it next connects). Notices: "restart
+  needed" after a binary upgrade, "adapter set differs from this release's
+  pin", outbox over its bound, another connection refused.
+- **MCP:** connection list with status and the connected account
+  (`account_label`); add/edit form per `cred_kind` (static token write-only;
+  pre-registered client id/secret; the redirect URI to register at the vendor;
+  an "internal network" switch with a warning), step-up on the listed edits;
+  **Connect** opens the consent popup blank inside the click handler, sets its
+  `opener` to `null` and navigates it to the (`https`) consent URL after the
+  authorize call returns, keeping the URL visible as a link if the popup is
+  blocked *(F-18: passing `noopener` to `window.open` makes it return `null`,
+  so every attempt looked blocked)*; a grid of **all hosts** per connection
+  (mounts saved as a full set), marking hosts where an agent falls back to
+  default-hat mounts; per (host, hat), the local stdio servers (command, args,
+  env; step-up); a persistent note that changes apply to new and resumed
+  sessions. Vendor error text renders as text.
+- **Hats:** create, rename, theme (colour; logo uploaded as SVG or PNG,
+  sanitised by the server and always rendered as `<img>`), default hat per
+  host, path rules per host with a live "this path resolves to" tester, and
+  "Purge hat" (lists what will be deleted; confirmation plus step-up).
 - **Settings:** account and passkeys, push devices (subscribe/unsubscribe per
-  device), `public_url`, per-hat push policy (mute, include details).
+  device), `public_url` (with a warning that passkeys and OAuth registrations
+  must be redone after a change), per-hat push policy (mute, include details,
+  generic title), and the deployment warning when the collector shares its OS
+  user with agents while holding credentials for several hats (kernel spec
+  §10).
 
 **Theme:** the selected hat's colours are applied as custom properties on
 `<html>` before first render (from a small inline script reading the persisted
-choice), so there is no flash of the default palette.
+choice), so there is no flash of the default palette. This is the only inline
+script; its hash is allowed by the Content-Security-Policy (kernel spec §7.2).
 
 ---
 
@@ -353,12 +394,16 @@ choice), so there is no flash of the default palette.
 - **Fold:** table-driven over captured fixtures per pinned adapter version;
   every tool-output shape; merge semantics; unknown kinds visible.
 - **Cards:** every elicitation shape incl. unsupported; mutual exclusion;
-  delivery states; monotonic verdict; shortcuts inert in editable targets.
+  delivery states incl. queued and `already_answered`; monotonic verdict;
+  shortcuts inert in editable targets.
+- **Rendering:** raw HTML in agent output appears as text; no inline script
+  anywhere except the hashed theme bootstrap.
+- **Step-up:** a `step_up_required` response prompts and retries once.
 - **List:** day buckets across DST; search bypasses filters; parked never
   hidden; selection rules across hat switches.
 - **Composer:** marker/attachment consistency; per-session draft isolation.
 - **Data layer:** delta application, resync on `resync_required`, no refetch on
-  events (spy on fetch).
+  events (spy on fetch); timeline opens at the tail and pages with `before=`.
 - **Playwright** (desktop 1280 px and mobile 390 px): setup → login → pair host
   (with a test host) → start session against the fake adapter → answer a
   permission → receive a push (Chromium) → resume after host restart. Visual
@@ -404,5 +449,3 @@ cross-tab stream sharing.
 
 1. **Transcript windowing threshold** — measure with real long sessions before
    choosing a library.
-2. **Hat logos** — is a PNG option worth keeping, given it cannot follow the
-   theme colour?

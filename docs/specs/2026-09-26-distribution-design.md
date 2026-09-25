@@ -23,8 +23,8 @@ One binary, `roost`:
 | `roost host join <url> <code>` | Pair this machine and install its runtime (§3) |
 | `roost host run` | Run a paired host |
 | `roost host adapters update` / `rollback` | Switch to the adapter set pinned by this binary / back to the previous one |
-| `roost mcp apply --client claude\|codex` | Render a gateway manifest into agent config |
-| `roost service install\|uninstall\|status [--role up\|host\|collector]` | launchd / systemd user service (§6) |
+| `roost mcp apply --client claude\|codex` | Render a standalone client's gateway manifest into agent config; token from `--token-file`, `ROOST_MCP_TOKEN` or stdin, never a flag (gateway spec §3.3) |
+| `roost service install\|uninstall\|status [--role up\|host\|collector]` | launchd / systemd user service, one per role (§6) |
 | `roost doctor` | Diagnose (§7) |
 | `roost backup`, `roost restore`, `roost admin …` | Via the collector's admin socket (kernel spec) |
 | `roost collector healthcheck` | Exit 0/1 against `/healthz` (containers) |
@@ -138,6 +138,11 @@ CI and read by both the host and the Nix flake:
   its set**, never through `current`, so an update never changes files under a
   running session. The previous set is kept for `rollback`; older sets are
   deleted once no adapter process uses them.
+- **After a binary upgrade** the host keeps using its installed set and warns
+  (Hosts view, `doctor`) that it differs from the set pinned by the new binary.
+  On the next host start (which always begins with no attached sessions) it
+  installs the pinned set before accepting sessions; `roost host adapters
+  update` does the same on demand and leaves running sessions on their old set.
 - **Disk budget:** roughly 700 MB per set on Linux x64 (the bundled agent CLIs
   are most of it); about 1.5 GB for two sets plus Node. `join` checks free space
   first.
@@ -221,9 +226,15 @@ runtime (§3.2), so the installer never touches the npm registry.
 
 `roost up` runs as a small supervisor with two children: `roost collector` and
 `roost host run`. They communicate only over the collector's normal WebSocket
-(umbrella §3.3). On first start the supervisor mints a pairing code through
-the collector's admin socket and hands it to the host child through an
-inherited file descriptor (kernel spec §4.2).
+(umbrella §3.3). On first start the collector child hands the supervisor a
+pairing code over an inherited file descriptor, and the supervisor passes it to
+the host child through another inherited file descriptor — never on a command
+line (kernel spec §4.2). Pairing is idempotent: if the host's `host.key`
+exists and the collector accepts it, no code is minted.
+
+At start `roost up` checks whether gateway credentials exist for more than one
+hat while the collector shares its OS user with the host child, and warns if so
+(kernel spec §10).
 
 ### 5.2 Restart policy
 
@@ -235,16 +246,18 @@ inherited file descriptor (kernel spec §4.2).
 
 ### 5.3 Upgrades
 
-- The supervisor watches its own executable path. When the file is replaced
-  (package manager upgrade), it restarts the **collector** child immediately on
-  the new binary. The **host** child keeps running the old binary until no
-  session has a turn in flight, then restarts; `roost admin restart-host
-  --now` forces it. Sessions parked by the host restart are resumable
-  (umbrella §3.3 "honest limit").
-- A service-manager restart of the whole unit restarts both children; package
-  managers do not restart user services by themselves.
+- **The upgrade path is a service-manager restart** (`launchctl kickstart -k`,
+  `systemctl --user restart`). Package managers do not
+  restart user services by themselves, so after an upgrade the running
+  processes keep the old binary; roost detects that the binary on disk differs
+  from the running version and warns that a restart is needed (Hosts view,
+  `doctor`). There is no binary-watching logic.
+- Restarting `roost up` restarts both children, and a host restart parks every
+  session; the sessions are resumable, not uninterrupted (umbrella §3.3
+  "honest limit").
 - Protocol compatibility (collector accepts host protocol majors M and M−1,
-  umbrella §5.3) makes the window where the host runs an older binary safe.
+  umbrella §5.3) makes it safe to upgrade the collector and remote hosts at
+  different times.
 
 ---
 
@@ -292,15 +305,27 @@ explicitly (behaviour to be confirmed on a machine rebooted without login).
 
 ### 6.3 Linux (systemd user unit)
 
+One unit per role, each written with the correct subcommand and the
+**absolute path of the binary resolved at install time** (Homebrew, the
+installer's directory, a Nix profile):
+
+| Role | Unit | `ExecStart` |
+|---|---|---|
+| `up` | `roost.service` | `<abs path>/roost up` |
+| `host` | `roost-host.service` | `<abs path>/roost host run` |
+| `collector` | `roost-collector.service` | `<abs path>/roost collector` |
+
+Example (`roost-host.service`):
+
 ```ini
 [Unit]
-Description=roost %i
+Description=roost host
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/roost host run
+ExecStart=/home/me/.local/bin/roost host run
 EnvironmentFile=-%h/.config/roost/service.env
 Environment=ROOST_SERVICE=systemd
 Restart=on-failure
@@ -314,6 +339,8 @@ WantedBy=default.target
 
 - `KillMode=mixed` lets the host stop its adapters itself (flush outbox, kill
   process groups) before systemd kills the rest.
+- If the binary later moves (a different package manager), `doctor` reports
+  that the unit points at a missing or different binary.
 - **Linger:** without it the host stops at logout and does not start at boot.
   `service install` checks `loginctl show-user $USER -p Linger` and, if `no`,
   prints `loginctl enable-linger $USER` (it may need privileges) instead of
@@ -339,11 +366,15 @@ are never printed (only "logged in" and the method).
 | 7 | Collector: DNS, TCP, TLS, certificate matches `public_url`; `http://` only on loopback; WebSocket `hello` accepted (revoked → "re-pair with `roost host join`") |
 | 8 | Clock skew against the collector's `Date` header (warn > 30 s, fail > 5 min) |
 | 9 | Disk: free space for two adapter sets and the outbox; current outbox size; recent transcript gaps |
-| 10 | Service: installed, active; linger on Linux; only one role installed per machine |
+| 10 | Service: installed, active, pointing at this binary; linger on Linux; only one role installed per machine; restart needed after an upgrade (running version ≠ binary on disk) |
 | 11 | Another `roost` earlier on PATH (name collision, §11) |
+| 12 | Adapter set: installed set differs from the one pinned by this binary (warn, with `roost host adapters update`) |
+| 13 | Bundled vs terminal CLI: the pinned bundled `claude`/`codex` version compared with the one on the user's PATH; warn on a large gap (sessions resumed from the terminal may meet an unexpected format) |
+| 14 | Single instance: no other host process holds `host.lock` in this data directory |
+| 15 | Collector isolation: gateway credentials for more than one hat while the collector shares its OS user with agents (warn, kernel spec §10) |
 
-The host runs checks 3–4 and 9 on demand (`probe_agents`) and reports them to
-the collector, so the Hosts view shows them without a terminal.
+The host runs checks 3–4, 9, 12 and 13 on demand (`probe_agents`) and reports
+them to the collector, so the Hosts view shows them without a terminal.
 
 ---
 
@@ -356,7 +387,22 @@ the collector, so the Hosts view shows them without a terminal.
 | Service env | `~/.config/roost/service.env` | in the plist |
 
 `ROOST_DATA_DIR` overrides the data directory (containers, tests). Logs rotate
-at 10 MiB × 5 files.
+at 10 MiB × 5 files. A collector and a host on the same machine (`roost up`)
+share the data directory; their files do not overlap.
+
+**Host data directory:**
+
+| Entry | Purpose |
+|---|---|
+| `host.key` | Ed25519 private key from pairing (0600) |
+| `host.toml` | Collector URL, host id, workspace roots, agent overrides |
+| `outbox.db` | Outbox (ACP core §5.5) |
+| `runtimes/` | Managed Node (§3.2) |
+| `adapters/` | Adapter sets (§3.2) |
+| `codex-home/` | Composed `CODEX_HOME` per hat (ACP core §6) |
+| `host.lock` | Exclusive lock; a second `roost host run` refuses to start |
+
+The collector's data directory is described in the kernel spec §1.
 
 ---
 
@@ -370,11 +416,17 @@ at 10 MiB × 5 files.
   update; rollback.
 - Manifest generator: `libc` filtering; a platform missing a package fails the
   job.
-- Supervisor: child crash backoff and give-up; binary replacement restarts the
-  collector at once and the host only when idle.
+- Supervisor: child crash backoff and give-up; pairing code passed only
+  through inherited descriptors; no re-pairing when the existing key is
+  accepted.
+- Upgrade: a replaced binary triggers the "restart needed" warning and nothing
+  else; a host keeps its adapter set until its next start or
+  `adapters update`.
 - Service install: PATH capture from bash, zsh and fish; volatile entry
-  replacement; generated units validated (`systemd-analyze verify`,
+  replacement; one unit per role with the absolute binary path and the right
+  subcommand; generated units validated (`systemd-analyze verify`,
   `plutil -lint`).
+- Host lock: a second `roost host run` on the same data directory refuses.
 - Doctor: each check's failure path with fixtures.
 - Nix: flake checks build the binary and the adapter derivation on Linux and
   macOS in CI.
@@ -422,5 +474,7 @@ Checked 2026-09-26:
    or should roost support a keychain-less credential path?
 3. **Adapter set size** — ~700 MB per set is mostly the bundled CLIs. Is it
    worth offering "use my own CLI" (`CLAUDE_CODE_EXECUTABLE`, `CODEX_PATH`) as a
-   first-class, space-saving install option, at the cost of losing the pin's
-   guarantee?
+   first-class, space-saving install option? The cost is losing the pin's
+   guarantee and, because any override drops that agent to the mixed-host MCP
+   fallback unless the operator accepts unverified isolation (ACP core §6), the
+   gateway's per-hat mounts on mixed hosts.
