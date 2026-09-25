@@ -6,8 +6,7 @@
   ownership, trust boundaries and module seams. Each subsystem (ACP core, MCP
   gateway, distribution) gets its own spec that refines this one; where they
   disagree, this document wins until it is amended.
-- **Language:** implementation language is deliberately not chosen here (see
-  [Open questions](#16-open-questions)). Nothing below depends on it.
+- **Language:** Rust (decided 2026-09-26, §9.1). The frontend is TypeScript.
 
 Throughout, "the predecessor" means an earlier private prototype of the same
 idea that ran for several months on one developer's machines. It is the source
@@ -250,14 +249,22 @@ The first frame from a host is `hello`:
 - `capabilities` gate features: the collector does not send a frame kind the
   host did not advertise, and the UI hides features no connected host supports.
 
-### 5.4 Schema-first
+### 5.4 One source of truth for message types
 
-One source of truth (JSON Schema, possibly authored in TypeSpec) describes every
-control frame and REST payload. From it are generated: backend types, frontend
-TypeScript types, and round-trip contract tests.
+Every control frame and REST payload is defined once, as Rust types (tagged
+`serde` enums for frame kinds). From them are generated: a JSON Schema
+(`schemars`), the frontend's TypeScript types (`ts-rs` or `specta`), and
+round-trip contract tests. The generated artefacts are checked in, and CI fails
+if regenerating them produces a diff.
 
-Dispatch is **exhaustive**: adding a frame type without a handler fails CI (via
-a generated switch plus a lint, whatever the implementation language offers).
+Dispatch is **exhaustive by construction**: frames are an enum and handlers a
+`match` without a wildcard arm, so adding a frame type without a handler is a
+compile error, not a test failure.
+
+*Rejected:* schema-first (JSON Schema or TypeSpec as the source, Rust generated
+from it). Generators for Rust handle tagged unions poorly, which is exactly the
+shape most of these types have; making Rust the source keeps the unions native
+and still gives every other consumer a schema.
 
 *Rejected:* hand-written types per layer. In the predecessor one message shape
 was hand-mirrored across four layers, and a result frame was missing from the
@@ -418,6 +425,24 @@ host knows whether an adapter callback was actually waiting for it, and reports
 When several clients answer the same request (phone and desktop), the first
 delivered answer wins and a later drop must not overwrite it: the fold over
 acknowledgements is monotonic (`delivered` sticks).
+
+### 6.9 One adapter process per session
+
+The host spawns a separate adapter process for every session (decided
+2026-09-26).
+
+- A crash, hang or memory leak affects one session, never its neighbours.
+- Per-hat isolation needs no extra machinery: Codex's isolation is per process
+  (a roost-owned composed `CODEX_HOME`), Claude's is per session (a strict-MCP
+  flag), and both fit a process-per-session model directly (see
+  [the spike](../spikes/2026-09-25-per-session-mcp.md)).
+- The idle reaper (§6.6) is what bounds memory: an idle session's process is
+  released and the session parks.
+
+*Rejected:* one adapter process per hat (or per agent) serving many sessions.
+It saves memory but a single fault takes every session in the group down, and
+it would need per-session isolation that Codex does not offer inside one
+process.
 
 ---
 
@@ -589,7 +614,7 @@ Three modules plus a shared kernel. Dependencies point one way.
                ▼                     ▼
         ┌─────────────────────────────────────┐
         │ kernel: auth, hats, storage, config, │
-        │ schema-generated types, HTTP server  │
+        │ message types, HTTP server           │
         └─────────────────────────────────────┘
         distribution: CLI, supervisor, runtime manager, renderers
 ```
@@ -604,7 +629,32 @@ Three modules plus a shared kernel. Dependencies point one way.
   installation and the config renderers.
 
 The test that the boundary holds: `roost gateway` (standalone) builds and runs
-with the ACP core absent from its wiring.
+with the ACP core absent from its wiring. In Rust this is a Cargo workspace
+where the gateway crate does not depend on the ACP-core crate.
+
+### 9.1 Implementation language: Rust
+
+Decided 2026-09-26. The reasons are specific to roost, not general:
+
+- **Both protocols have official Rust SDKs**: `agent-client-protocol` for ACP
+  and `rmcp` for MCP.
+- **Most domain types are tagged unions** — frames, credential kinds, the two
+  status axes. Native enums plus exhaustive `match` turn the predecessor's
+  worst class of bug (a frame with no handler, tests still green) into a
+  compile error (§5.4).
+- The rest is standard ground: `tokio` for subprocesses and I/O, `axum` for
+  HTTP/SSE and the streaming proxy, a WebSocket crate, SQLite
+  (`rusqlite` or `sqlx`), `webauthn-rs`, `argon2`, and embedded static assets.
+  Static binaries for Linux (musl) and macOS arm64 are routine.
+
+Costs accepted: slower compiles and a steeper start with async Rust
+(cancellation, `Send` bounds, streaming lifetimes).
+
+*Rejected:* Go. It fits the I/O-glue shape well and the predecessor is written
+in it, but roost is a rewrite, not a port, and Go needs codegen plus a linter
+to approximate the exhaustiveness Rust gives for free.
+
+Crate choices above are indicative; subsystem specs and plans pin them.
 
 ---
 
@@ -693,7 +743,7 @@ gated by collector capabilities.
 
 ### 11.1 REST
 
-Resource-oriented JSON over HTTPS, types generated from the shared schema.
+Resource-oriented JSON over HTTPS, types generated from the Rust message types (§5.4).
 Mutations that reach a host (prompt, cancel, answer, start) return `202` with an
 operation id when the host round trip is asynchronous; the outcome arrives over
 SSE.
@@ -775,7 +825,7 @@ documented next to the backup instructions.
 
 - React + TypeScript + Vite, built to static files **embedded in the binary**
   (works offline, no CDN).
-- Control-frame and REST types generated from the shared schema; session event
+- Control-frame and REST types generated from the Rust message types (§5.4); session event
   payloads typed with the official ACP SDK.
 - Realtime via SSE resuming from `event_id` (§11.2).
 - **Views (v1):**
@@ -806,7 +856,7 @@ documented next to the backup instructions.
 
 | Layer | What | Why |
 |---|---|---|
-| Protocol | Contract tests generated from the schema: every frame round-trips. CI lint for exhaustive dispatch. | Hand-mirrored shapes drift silently (§5.4). |
+| Protocol | Contract tests generated from the schema: every frame round-trips. Exhaustive dispatch is a compile-time property; CI fails on a diff in regenerated schema/TS types. | Hand-mirrored shapes drift silently (§5.4). |
 | Transport parity | The same scenarios run over the in-memory pipe and a real WebSocket. | One code path must stay tested in both deployments (§3.3). |
 | Session behaviour | Deterministic **fake ACP adapter**: scripted replies, permissions, elicitation, replay on `session/load`. Scenarios: WS drop, collector restart, host restart, outbox resend, seq dedup, outbox overflow → gap, reaper vs. blocked, answer delivered vs. dropped, multi-client answer. | Every failure row in §6.6 gets a test. |
 | Live e2e gate | Real `claude-agent-acp` and `codex-acp` on every adapter pin bump: start, prompt, tool call, permission, elicitation, resume. | In the predecessor only a live call caught a wrongly shaped capability that the SDK silently discarded; unit tests asserted our JSON against our own assumption. |
@@ -865,13 +915,12 @@ hermetic package builds stay green.
    The outcome decides whether the §8.5 fallback is needed for either agent.
    It does **not** settle isolation in general: agents sharing an OS user can
    still read each other's data on disk (§8.4).
-2. **Implementation language.** Undecided; the spec is language-neutral.
-   Leaning Go: the product is mostly I/O glue (WebSocket, stdio subprocesses,
-   streaming HTTP proxy, SQLite, JSON), cross-compiles to static binaries, and
-   the predecessor is a Go reference. Rust's real advantages are sum types for
-   the many tagged unions (frames, credential kinds, status axes) and a
-   first-class official ACP crate. In Go the gap is mitigated by codegen with
-   exhaustive dispatch plus an exhaustiveness linter.
+2. **ACP Rust SDK coverage.** The host uses the Rust ACP crate while adapters
+   and the frontend use the TypeScript SDK. Unstable protocol parts (e.g.
+   elicitation) may land later in Rust or sit behind a feature flag. The host
+   passes ACP payloads through verbatim, so it can hold unknown fields as raw
+   JSON, but this must be checked against the pinned adapters at the start of
+   implementation.
 3. **Name collision.** "roost" is not yet checked against existing projects
    (e.g. ROOST, an open-source online-safety tools organisation), package
    registries, or the Homebrew namespace.
