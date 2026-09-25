@@ -214,6 +214,7 @@ response or a timeout):**
 | `answer_elicitation` | session_id, request_id, action, content? | `answer_result{delivered}` |
 | `list_projects` | roots[] | `projects{items[], partial}` |
 | `browse_directory` | path | `directory{entries[]}` / `error` |
+| `resolve_path` | path | `resolved_path{canonical, exists, is_dir}` / `error` (kernel spec §5.4) |
 | `apply_mcp_mounts` | manifest (gateway spec) | `ok` |
 | `probe_agents` | — | `agents{…}` (same shape as in `hello`) |
 
@@ -509,10 +510,21 @@ cannot collide with the user's own server names (the spike showed Codex
 silently drops a session server whose name exists in config).
 
 **Agent availability** in `hello.agents[]` and `probe_agents`:
-`available` = the adapter can be launched; `auth` = `ok | missing | unknown`,
-probed with `codex login status` for Codex and reported `unknown` for Claude
-until a non-interactive status check exists. The UI still offers an agent with
-`auth: unknown`, and a `-32000` on first use maps to `agent_not_logged_in`.
+`available` = the adapter can be launched; `auth` = `ok | missing | unknown`.
+Auth is taken, in order, from the adapter's `_auth/status_update` notification
+sent right after `initialize` (an underscore-prefixed extension both pinned
+adapters emit: `kind: "account"` or `kind: "none"`), then from the bundled CLI
+(`claude auth status`, `codex login status`; exit 0 = logged in), then
+`unknown`. Account details in those payloads (email, organisation) are never
+forwarded; only the boolean and the method. A `-32000` on first use still maps
+to `agent_not_logged_in`.
+
+**The adapters bundle their own agent CLI** (a platform-specific native
+package resolved from the adapter's `node_modules`); they do not use the
+`claude`/`codex` on the user's PATH, only the user's login state
+(`~/.claude`, the macOS keychain, `~/.codex/auth.json`). The adapter pin
+therefore decides the CLI version. `CLAUDE_CODE_EXECUTABLE` / `CODEX_PATH` are
+exposed as an advanced override in the profile.
 
 ---
 
@@ -758,7 +770,5 @@ session, Changes tab, config explorer, auto-naming, memory. Gateway internals
 
 ## 16. Open questions
 
-1. **Claude login detection.** No non-interactive status command is known;
-   `auth: unknown` until one is found.
-2. **Attachment retention.** Images live as long as their session. Is a size
+1. **Attachment retention.** Images live as long as their session. Is a size
    cap per installation needed in v1?
