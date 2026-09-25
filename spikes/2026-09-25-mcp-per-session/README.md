@@ -12,6 +12,8 @@ Not part of the product.
 - `run.sh` — resets probe logs, drives one session, prints the summary and
   probe hit counts.
 - `count.py` — summarises probe logs.
+- `compose_codex_home.py SRC DST` — builds a composed `CODEX_HOME` (symlinks
+  plus `config.toml` without `mcp_servers`).
 
 Sketch of a run (work dir defaults to `/tmp/roostspike`):
 

@@ -107,10 +107,14 @@ try:
         params["_meta"] = json.loads(a.meta)
     if a.load:
         params["sessionId"] = a.load
-        call("session/load", params)
+        started = call("session/load", params)
         sid = a.load
     else:
-        sid = call("session/new", params)["sessionId"]
+        started = call("session/new", params)
+        sid = started["sessionId"]
+    models = (started or {}).get("models") or {}
+    out["currentModelId"] = models.get("currentModelId")
+    out["availableModels"] = [m.get("modelId") for m in models.get("availableModels", [])]
     out["sessionId"] = sid
     t0 = time.time()
     res = call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": a.prompt}]})

@@ -847,8 +847,8 @@ hermetic package builds stay green.
 1. **Per-project / per-session MCP config — measured 2026-09-25, see
    [the spike](../spikes/2026-09-25-per-session-mcp.md).** Summary: both
    adapters accept per-session servers and also load global ones; Claude can be
-   isolated per session via a `_meta` strict flag, Codex only via a roost-owned
-   `CODEX_HOME` per adapter process. Original question: on
+   isolated per session via a `_meta` strict flag, Codex via a roost-owned,
+   composed `CODEX_HOME` per adapter process that keeps the user's setup. Original question: on
    a mixed host, Claude Code and Codex each have one global MCP config per user.
    Per-hat isolation needs a narrower injection path. Candidates, to be
    **measured, not assumed**:

@@ -89,17 +89,54 @@ the user's `auth.json` and an empty `config.toml`) removed the global probe:
 
 Consequences, all measured:
 
-- **Session history lives in `CODEX_HOME`.** Resuming with the same isolated
-  home worked; resuming the same session id with the default home failed with
+- **Session history lives in `CODEX_HOME`.** With an empty isolated home,
+  resuming with the same home worked; resuming the same session id with the default home failed with
   `no rollout found for thread id …`. The home chosen for a session must stay
   fixed for its whole life.
 - `CODEX_HOME` is per **process**, so isolation is per adapter process: roost
   needs at least one Codex adapter process per hat (or per session).
 - An empty home also drops the user's own Codex setup (AGENTS.md, skills,
-  model defaults) and hides roost sessions from the terminal's resume list. A
-  composed home (symlink everything except `config.toml`, generate
-  `config.toml` from the user's minus `mcp_servers`) should avoid that; **not
-  measured**.
+  model defaults) and hides roost sessions from the terminal's resume list.
+  The composed home below removes both costs.
+
+### Codex: a composed `CODEX_HOME` keeps the user's setup
+
+Measured on 2026-09-26 against a synthetic user home (so the real one was not
+touched) containing: a symlinked `auth.json`, an `AGENTS.md` with a marker
+instruction, a skill, `model`/`model_reasoning_effort` settings, and a global
+MCP probe. The composed home
+([`compose_codex_home.py`](../../spikes/2026-09-25-mcp-per-session/compose_codex_home.py))
+symlinks every top-level entry except `config.toml`, which is copied with all
+`mcp_servers` tables removed.
+
+| Home used by the adapter | AGENTS.md | skill | model settings | global MCP | session MCP |
+|---|---|---|---|---|---|
+| user home | followed | used | applied (`luna[high]`) | loaded, called | loaded, called |
+| composed home | followed | used | applied (`luna[high]`) | — | loaded, called |
+
+Resume across homes, possible because `sessions/` is shared through the
+symlink:
+
+| Session created under | Loaded under | Result | MCP servers after load |
+|---|---|---|---|
+| composed home | user home | resumed | global + session |
+| user home | composed home | resumed | session only |
+
+So:
+
+- The earlier "history is lost with an isolated home" cost disappears: roost
+  sessions stay in the user's normal history and can be resumed from a
+  terminal.
+- **The MCP set follows the adapter process that loads the session, not the
+  session.** Resuming a roost session from the terminal gives it the user's
+  global servers; that is the operator's own choice, outside roost.
+- **Divergence risk, observed:** during the run Codex created a new real
+  directory (`mcp-oauth-locks`) inside the composed home instead of the user's.
+  Anything Codex creates at the top level after composition lands in the
+  roost copy. A product implementation must re-compose on every adapter start
+  and decide per entry whether a newly appearing path is shared or private.
+- The line-based TOML filter is spike quality; the product needs a real TOML
+  parser (inline `mcp_servers = {…}` tables, dotted keys).
 
 ### Codex: name collisions silently drop the session server
 
@@ -147,11 +184,12 @@ servers too; Codex's isolated home does not.
    assert it (global probe must receive nothing). Trade-off: strict mode also
    hides the user's own servers and account connectors from roost sessions,
    which is consistent with the gateway being the single place MCP is managed.
-3. **Codex:** isolation requires a roost-owned `CODEX_HOME` per hat (or per
-   session), stable for the session's life. The composed-home variant needs a
-   follow-up measurement before the gateway spec commits to it. Until then the
-   spec's §8.5 fallback (mixed hosts get only default-hat mounts) applies to
-   Codex, not to Claude.
+3. **Codex:** isolation requires a roost-owned, **composed** `CODEX_HOME`
+   (user's files shared by symlink, `config.toml` minus `mcp_servers`),
+   re-composed on every adapter start, with one adapter process per hat (or
+   per session). It preserves the user's setup and history. With this, the
+   spec's §8.5 fallback is not needed for either agent on the measured
+   versions; it stays as the rule for any agent without an isolation path.
 4. **Gateway transport:** streamable HTTP only (Codex has no SSE transport).
 5. **Server names:** namespace roost-injected servers to avoid collisions.
 
@@ -159,7 +197,8 @@ servers too; Codex's isolated home does not.
 
 - Claude project `.mcp.json` scope (strict mode documents it as ignored).
 - Plugin-provided MCP servers under strict mode (none were connected).
-- The composed `CODEX_HOME` variant.
+- Concurrent Codex app-servers from the user home and a composed home writing
+  the same shared SQLite state at the same time.
 - Several concurrent sessions sharing one adapter process with different
   mounts.
 - Linux hosts.
