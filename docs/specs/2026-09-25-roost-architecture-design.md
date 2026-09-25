@@ -3,9 +3,14 @@
 - **Date:** 2026-09-25
 - **Status:** Draft, awaiting review
 - **Scope:** the whole product at the level of processes, protocols, state
-  ownership, trust boundaries and module seams. Each subsystem (ACP core, MCP
-  gateway, distribution) gets its own spec that refines this one; where they
-  disagree, this document wins until it is amended.
+  ownership, trust boundaries and module seams. Each subsystem gets its own
+  spec that refines this one; where they disagree, this document wins until it
+  is amended:
+  [ACP core](2026-09-26-acp-core-design.md),
+  [MCP gateway](2026-09-26-mcp-gateway-design.md),
+  [kernel](2026-09-26-kernel-design.md),
+  [frontend](2026-09-26-frontend-design.md),
+  [distribution](2026-09-26-distribution-design.md).
 - **Language:** Rust (decided 2026-09-26, §9.1). The frontend is TypeScript.
 
 Throughout, "the predecessor" means an earlier private prototype of the same
@@ -178,6 +183,11 @@ Indicative, not a schema. Every table has `owner_id`.
 | `push_subscription` | endpoint, keys, device label | |
 | `setting` | key, value | Includes `public_url`. |
 
+Subsystem specs add tables: `turns`, `attachments`, `session_catalog`,
+`host_agent_catalog`, `plans` (ACP core §8); `gw_oauth_clients` and the
+`oauth_client` credential kind (gateway §2); `auth_sessions` and
+`push_subscriptions` details (kernel).
+
 ---
 
 ## 5. Host ↔ collector protocol
@@ -253,7 +263,7 @@ The first frame from a host is `hello`:
 
 Every control frame and REST payload is defined once, as Rust types (tagged
 `serde` enums for frame kinds). From them are generated: a JSON Schema
-(`schemars`), the frontend's TypeScript types (`ts-rs` or `specta`), and
+(`schemars`), the frontend's TypeScript types (`ts-rs`; `specta` was evaluated and emits a wrong shape for internally tagged enums), and
 round-trip contract tests. The generated artefacts are checked in, and CI fails
 if regenerating them produces a diff.
 
@@ -399,7 +409,7 @@ the kind name.
 |---|---|
 | WebSocket drops, host process survives | Host reconnects; `hello` lists attached sessions and unacked seqs; outbox is resent; collector reconciles. Sessions stay `active`, pending requests stay open. |
 | Collector restarts | Same as above from the host's side. Nothing is parked. |
-| Host restarts (crash, upgrade, reboot) | Adapters die with it. On reconnect, sessions that had a turn in flight get a `turn_interrupted` event; all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
+| Host restarts (crash, upgrade, reboot) | Adapters die with it. On reconnect, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
 | Host offline longer than the offline threshold (default 10 min, configurable) | Collector marks its sessions `parked` with a visible "host offline" note (presumed, not reported). On reconnect, `hello.attached_sessions` is authoritative: sessions whose adapter is still attached go `parked → active` without a resume, pending requests intact; the rest stay `parked`. |
 | Idle (default 30 min, configurable, never mid-turn, never `blocked`) | Host's reaper releases the adapter; session becomes `parked`. |
 | `session/load` fails | Session becomes `failed` with a readable reason (e.g. the agent CLI has no record of that session). |
@@ -644,7 +654,9 @@ Decided 2026-09-26. The reasons are specific to roost, not general:
   compile error (§5.4).
 - The rest is standard ground: `tokio` for subprocesses and I/O, `axum` for
   HTTP/SSE and the streaming proxy, a WebSocket crate, SQLite
-  (`rusqlite` or `sqlx`), `webauthn-rs`, `argon2`, and embedded static assets.
+  (`rusqlite`, bundled, one writer thread), `webauthn-rs`, `argon2`,
+  `chacha20poly1305`, `web-push-native`, `rmcp` (OAuth and the gateway's
+  liveness probe; the proxy itself is hand-written) and `rust-embed`.
   Static binaries for Linux (musl) and macOS arm64 are routine.
 
 Costs accepted: slower compiles and a steeper start with async Rust
@@ -654,7 +666,7 @@ Costs accepted: slower compiles and a steeper start with async Rust
 in it, but roost is a rewrite, not a port, and Go needs codegen plus a linter
 to approximate the exhaustiveness Rust gives for free.
 
-Crate choices above are indicative; subsystem specs and plans pin them.
+Versions and exact usage are pinned in the subsystem specs and plans.
 
 ---
 
@@ -677,8 +689,10 @@ into agent config; the operator never handles tokens or config files by hand.
 - **OAuth per the MCP authorization spec:** protected-resource metadata
   discovery, dynamic client registration, PKCE as a public client, single-flight
   refresh per connection, liveness probe via a real `initialize` handshake.
-- **Proxy** at `/mcp/<client-token>/<slug>`:
-  - One upstream session per (connection × client).
+- **Proxy** at `/mcp/<slug>`, with the client token in the `Authorization`
+  header (never in the URL, which leaks into logs and transcripts):
+  - One upstream session per downstream MCP session (`Mcp-Session-Id` passes
+    through; the gateway keeps no session table).
   - Streaming responses (SSE) are forwarded incrementally: the first chunk must
     reach the client before the upstream finishes writing. A buffering proxy
     works on every short response and fails on the first long one.
@@ -707,13 +721,17 @@ they do not protect against compromise of the collector itself.
 
 ### 10.3 Manifests and renderers
 
-The gateway does **not** write agent config files. It emits a **manifest** per
-principal: `[{slug, url, transport}]`.
+**roost sessions receive their MCP servers per session over ACP**, computed by
+the collector for the session's (host, hat) and passed in `session/new` /
+`session/load` (spike; gateway §3.2). Agent config files are not involved.
 
-**Renderers** turn a manifest into agent config:
+For standalone mode and terminal sessions started outside roost, the gateway
+emits a **manifest** per principal (`[{name, url, headers}]`) and
+**renderers** turn it into agent config:
 
-- host-side, automatically, when mounts change (`apply_mcp_mounts`);
-- CLI, `roost mcp apply --client claude|codex`, in standalone mode.
+- CLI, `roost mcp apply --client claude|codex`;
+- optionally host-side for the host's default hat (off by default, because a
+  global entry is visible to every hat on that host).
 
 Renderer rules:
 
@@ -807,9 +825,16 @@ binaries, so Node may not be installed at all, and version-manager PATH setups
 - Every pin bump passes a **live e2e gate** in CI (§14).
 - Advanced override: a custom adapter command in config — also the door for any
   other ACP agent.
-- roost does not install agent CLIs or perform their logins. `roost doctor`
-  checks them; "Authentication required" from an adapter always means the CLI on
-  that machine is not logged in, and doctor says so in those words.
+- The pins and their hashes live in one manifest compiled into the binary;
+  the host fetches each package tarball from the npm registry and verifies it
+  (distribution §3). Nothing runs npm on the user's machine.
+- The adapters bundle their own agent CLI; they need only the user's login
+  state. roost does not perform logins. `roost doctor` checks login state
+  non-interactively; "Authentication required" from an adapter always means the
+  agent on that machine is not logged in, and doctor says so in those words.
+- **The Claude adapter's bundled CLI is proprietary ("All rights reserved"),
+  so roost never redistributes it**: no release archive, image or public cache
+  contains it; every host downloads it itself.
 
 ### 12.4 Backups
 
@@ -894,49 +919,33 @@ hermetic package builds stay green.
 
 ## 16. Open questions
 
-1. **Per-project / per-session MCP config — measured 2026-09-25, see
-   [the spike](../spikes/2026-09-25-per-session-mcp.md).** Summary: both
-   adapters accept per-session servers and also load global ones; Claude can be
-   isolated per session via a `_meta` strict flag, Codex via a roost-owned,
-   composed `CODEX_HOME` per adapter process that keeps the user's setup. Original question: on
-   a mixed host, Claude Code and Codex each have one global MCP config per user.
-   Per-hat isolation needs a narrower injection path. Candidates, to be
-   **measured, not assumed**:
-   - Claude Code: `projects[<path>].mcpServers` in `~/.claude.json`.
-   - Codex: some form of project-scoped config — unverified.
-   - **ACP `session/new` `mcpServers`.** A first look at the currently pinned
-     `claude-agent-acp` shows it advertises `mcpCapabilities: {http, sse}` and
-     maps HTTP/SSE entries (including headers) from `session/new` into the
-     session. If both adapters honour this, roost-driven sessions could get
-     their hat's mounts per session without touching global config at all, and
-     renderers would matter only for sessions started outside roost. The spike
-     must also check whether globally configured servers are still loaded
-     alongside (which would reintroduce the leak) and what `codex-acp` does.
-   The outcome decides whether the §8.5 fallback is needed for either agent.
-   It does **not** settle isolation in general: agents sharing an OS user can
-   still read each other's data on disk (§8.4).
-2. **ACP Rust SDK coverage.** The host uses the Rust ACP crate while adapters
-   and the frontend use the TypeScript SDK. Unstable protocol parts (e.g.
-   elicitation) may land later in Rust or sit behind a feature flag. The host
-   passes ACP payloads through verbatim, so it can hold unknown fields as raw
-   JSON, but this must be checked against the pinned adapters at the start of
-   implementation.
-3. **Name collision.** "roost" is not yet checked against existing projects
-   (e.g. ROOST, an open-source online-safety tools organisation), package
-   registries, or the Homebrew namespace.
-4. **Host proof of possession.** Signed-nonce in `hello` is the working
-   assumption (§5.9); the exact scheme (and whether mTLS is simpler behind
-   reverse proxies) is for the ACP-core spec.
-5. **Symlinked project paths** in hat resolution: resolve before matching, or
-   match the path as the operator typed it? Affects both correctness and what
-   the operator expects.
+Resolved since the first draft:
+
+- *Per-project / per-session MCP config* — measured in
+  [the spike](../spikes/2026-09-25-per-session-mcp.md): roost sessions receive
+  MCP servers per session over ACP (Claude with a strict-MCP flag, Codex with a
+  composed `CODEX_HOME`). See gateway §3.2 and ACP core §6.
+- *Implementation language* — Rust (§9.1).
+- *ACP Rust SDK coverage* — use the crate's connection engine with raw payload
+  handlers (ACP core §2.4).
+- *Host proof of possession* — Ed25519 signature over a collector nonce
+  (ACP core §3.5).
+- *Symlinked paths* — canonicalised on the host before any matching
+  (kernel §5.2).
+
+Still open:
+
+1. **Name collision.** The name "roost" is already used by two 2026 projects in
+   the same niche (one owns crates.io `roost` and ships a `roost` binary via its
+   own Homebrew tap). Details and consequences in distribution §11; keeping or
+   changing the name is the operator's decision.
+2. Subsystem-level open questions are listed at the end of each subsystem spec.
 
 ---
 
 ## 17. Next steps
 
-1. Operator review of this spec.
-2. Spike: open question 1.
-3. Subsystem specs: ACP core, MCP gateway, distribution.
-4. Implementation plans per subsystem.
-
+1. Operator review of the umbrella and subsystem specs (all drafts).
+2. Decide on the name (§16).
+3. Implementation plans, starting with the walking skeleton
+   (`docs/plans/`).
